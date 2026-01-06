@@ -13,6 +13,9 @@ from collections import defaultdict
 import psutil
 import logging
 from collections import deque
+from tkinter.scrolledtext import ScrolledText
+import sqlite3
+from datetime import datetime
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -186,6 +189,9 @@ class VehicleCounterApp:
         self.last_fps_update = time.time()
         self.current_frame = None # Store for redrawing zone
         
+        # Database Initialization
+        self.init_db()
+        
         # UI
         self.create_widgets()
         self.update_status("Initializing... Loading Model...")
@@ -247,25 +253,38 @@ class VehicleCounterApp:
         
         ttk.Button(btn_box, text="Stop", command=self.stop_processing).pack(fill=tk.X, pady=2)
         
+        # Model Selection
+        self.load_model_btn = ttk.Button(btn_box, text="Load Custom Model", command=self.load_custom_model)
+        self.load_model_btn.pack(fill=tk.X, pady=(10, 2))
+        
         # Statistics Group
         self.stats_frame = ttk.LabelFrame(right_panel, text="Live Statistics", padding=10)
         self.stats_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         # Create Labels for classes
+        # Create Labels for classes - Dynamic now
         self.count_labels = {}
-        classes = ['Car', 'Bus', 'Motorcycle', 'Bicycle', 'Truck']
+        # classes will be populated on model load
         
-        for cls_name in classes:
-            row = ttk.Frame(self.stats_frame)
-            row.pack(fill=tk.X, pady=5)
-            
-            # Icon/Name
-            ttk.Label(row, text=f"{cls_name}:", font=("Arial", 11, "bold")).pack(side=tk.LEFT)
-            
-            # Count Value
-            lbl = ttk.Label(row, text="0 (In:0 Out:0)", font=("Arial", 11), foreground="blue")
-            lbl.pack(side=tk.RIGHT)
-            self.count_labels[cls_name] = lbl
+        # Add scrollable canvas for stats if many classes
+        self.stats_canvas = tk.Canvas(self.stats_frame, height=300)
+        self.stats_scrollbar = ttk.Scrollbar(self.stats_frame, orient="vertical", command=self.stats_canvas.yview)
+        self.scrollable_stats_frame = ttk.Frame(self.stats_canvas)
+        
+        self.stats_scroll_window = self.stats_canvas.create_window((0, 0), window=self.scrollable_stats_frame, anchor="nw")
+        
+        self.stats_canvas.configure(yscrollcommand=self.stats_scrollbar.set)
+        
+        self.stats_canvas.pack(side="left", fill="both", expand=True)
+        self.stats_scrollbar.pack(side="right", fill="y")
+        
+        self.scrollable_stats_frame.bind(
+            "<Configure>",
+            lambda e: self.stats_canvas.configure(
+                scrollregion=self.stats_canvas.bbox("all")
+            )
+        )
+
             
         # FPS Label at bottom of right panel
         self.fps_label = ttk.Label(right_panel, text="FPS: 0.0", font=("Arial", 10))
@@ -281,17 +300,19 @@ class VehicleCounterApp:
         self.progress.pack(side=tk.BOTTOM, fill=tk.X)
         self.progress.start(10)
 
-    def load_model(self):
+    def load_model(self, model_path=None):
         try:
-            model_path = 'models/yolov8n.pt'
-            if not os.path.exists('models'):
-                os.makedirs('models')
-            
-            # Download if needed (simple check)
-            if not os.path.exists(model_path):
-                self.root.after(0, lambda: self.update_status("Downloading Model..."))
-                YOLO('yolov8n.pt').export() # Triggers download
+            if model_path is None:
+                model_path = 'models/yolov8n.pt'
+                if not os.path.exists('models'):
+                    os.makedirs('models')
                 
+                # Download if needed (simple check)
+                if not os.path.exists(model_path):
+                    self.root.after(0, lambda: self.update_status("Downloading Model..."))
+                    YOLO('yolov8n.pt').export() # Triggers download
+            
+            self.root.after(0, lambda: self.update_status(f"Loading {os.path.basename(model_path)}..."))
             self.model = YOLO(model_path)
             if self.device == 'cuda':
                 self.model.to('cuda')
@@ -305,17 +326,93 @@ class VehicleCounterApp:
                     self.model.track(dummy_input, persist=True, device='cuda', verbose=False, half=True)
                 logger.info("GPU Warmup Complete")
                 
-            logger.info(f"Model loaded on {self.device.upper()}")
+            logger.info(f"Model loaded: {model_path} on {self.device.upper()}")
+            
+            # Update UI for classes
+            self.root.after(0, self.setup_stats_ui)
             
             # Enable buttons on main thread
             self.root.after(0, self.enable_ui)
-            self.root.after(0, lambda: self.update_status(f"Model Ready ({self.device.upper()})"))
+            self.root.after(0, lambda: self.update_status(f"Model Ready: {os.path.basename(model_path)} ({self.device.upper()})"))
             
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load model: {e}"))
         finally:
              self.root.after(0, self.progress.stop)
              self.root.after(0, self.progress.destroy)
+
+    def init_db(self):
+        """Initialize local SQLite database for logging"""
+        try:
+            self.conn = sqlite3.connect('gate_log.db', check_same_thread=False)
+            self.cursor = self.conn.cursor()
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS vehicle_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    vehicle_type TEXT,
+                    track_id INTEGER,
+                    direction TEXT,
+                    confidence REAL
+                )
+            ''')
+            self.conn.commit()
+            logger.info("Database initialized: gate_log.db")
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+
+    def log_to_db(self, vehicle_type, track_id, direction, confidence):
+        """Save a detection event to the database"""
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute('''
+                INSERT INTO vehicle_logs (timestamp, vehicle_type, track_id, direction, confidence)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (timestamp, vehicle_type, track_id, direction, confidence))
+            self.conn.commit()
+            logger.info(f"DB Log: {vehicle_type} #{track_id} {direction}")
+        except Exception as e:
+            logger.error(f"Failed to log to DB: {e}")
+
+    def setup_stats_ui(self):
+        # Clear existing
+        for widget in self.scrollable_stats_frame.winfo_children():
+            widget.destroy()
+        self.count_labels.clear()
+        
+        # Get classes from model
+        if self.model and hasattr(self.model, 'names'):
+            class_names = self.model.names
+            # Handle if names is dict or list
+            if isinstance(class_names, dict):
+                 self.active_classes = class_names
+            else:
+                 self.active_classes = {i: name for i, name in enumerate(class_names)}
+                 
+            for cls_id, cls_name in self.active_classes.items():
+                row = ttk.Frame(self.scrollable_stats_frame)
+                row.pack(fill=tk.X, pady=2, padx=5)
+                
+                # Icon/Name
+                ttk.Label(row, text=f"{cls_name}:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+                
+                # Count Value
+                lbl = ttk.Label(row, text="0 (In:0 Out:0)", font=("Arial", 10), foreground="#007acc")
+                lbl.pack(side=tk.RIGHT)
+                self.count_labels[cls_name] = lbl
+            
+            # Reset counters
+            self.counted_ids.clear()
+            self.total_counts.clear()
+
+    def load_custom_model(self):
+        path = filedialog.askopenfilename(filetypes=[("YOLO Model", "*.pt")])
+        if path:
+            self.progress = ttk.Progressbar(self.root, mode='indeterminate')
+            self.progress.pack(side=tk.BOTTOM, fill=tk.X)
+            self.progress.start(10)
+            threading.Thread(target=self.load_model, args=(path,), daemon=True).start()
+
 
     def enable_ui(self):
         self.browse_btn.config(state=tk.NORMAL)
@@ -444,7 +541,12 @@ class VehicleCounterApp:
             for box in results.boxes:
                 # Class Mapping
                 cls_id = int(box.cls[0].item())
-                label = self.get_label(cls_id)
+                # Use dynamic labels from model
+                if self.model and hasattr(self.model, 'names'):
+                     label = self.model.names[cls_id]
+                else:
+                     label = str(cls_id) 
+                
                 if not label: continue
                 
                 # Coords
@@ -512,6 +614,8 @@ class VehicleCounterApp:
                                  if delta > 0:
                                      if track_id not in self.counted_ids[label]['in']:
                                         self.counted_ids[label]['in'].add(track_id)
+                                        # Log to Database
+                                        self.log_to_db(label, track_id, "IN", float(box.conf[0].item()))
                                         logger.info(f"Counted IN: {label} #{track_id}")
                                  
                                  # OUT: Moving Up (negative delta)
@@ -519,6 +623,8 @@ class VehicleCounterApp:
                                  elif delta < 0:
                                      if track_id not in self.counted_ids[label]['out']:
                                         self.counted_ids[label]['out'].add(track_id)
+                                        # Log to Database
+                                        self.log_to_db(label, track_id, "OUT", float(box.conf[0].item()))
                                         logger.info(f"Counted OUT: {label} #{track_id}")
 
                     # Update position
@@ -547,10 +653,7 @@ class VehicleCounterApp:
             
         self.display_frame(frame)
 
-    def get_label(self, cls_id):
-        # 2:car, 5:bus, 3:motorcycle, 1:bicycle, 7:truck
-        mapping = {2: 'Car', 5: 'Bus', 3: 'Motorcycle', 1: 'Bicycle', 7: 'Truck'}
-        return mapping.get(cls_id)
+
 
     def display_frame(self, frame, is_video=True):
         # Resize to fit canvas

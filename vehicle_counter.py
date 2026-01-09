@@ -19,6 +19,7 @@ from datetime import datetime
 import easyocr
 import cv2
 import urllib.parse
+import calendar
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -306,7 +307,10 @@ class VehicleCounterApp:
         # Treeview (Log Table)
         style.configure("Treeview", background="white", foreground="black", fieldbackground="white", rowheight=25)
         style.map("Treeview", background=[("selected", accent)], foreground=[("selected", "white")])
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        style.configure("Treeview.Heading", background="#e1e1e1", font=("Segoe UI", 10, "bold"))
+        
+        # Calendar/Entry
+        style.configure("Date.TEntry", padding=5)
         
     def init_ocr(self):
         try:
@@ -417,37 +421,43 @@ class VehicleCounterApp:
         filter_bar = ttk.Frame(logs_container)
         filter_bar.pack(fill=tk.X, pady=(0, 15))
         
-        ttk.Label(filter_bar, text="Filter Type:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(filter_bar, text="Type:").pack(side=tk.LEFT, padx=5)
         self.filter_type_var = tk.StringVar(value="All")
-        self.filter_type_combo = ttk.Combobox(filter_bar, textvariable=self.filter_type_var, width=15)
-        self.filter_type_combo['values'] = ("All", "Car", "Truck", "Bus", "Motorcycle")
-        self.filter_type_combo.pack(side=tk.LEFT, padx=10)
+        self.filter_type_combo = ttk.Combobox(filter_bar, textvariable=self.filter_type_var, width=12)
+        self.filter_type_combo['values'] = ("All", "Car", "Truck", "Bus", "Motorcycle", "Auto")
+        self.filter_type_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(filter_bar, text="Plate:").pack(side=tk.LEFT, padx=5)
+        self.filter_plate_var = tk.StringVar()
+        ttk.Entry(filter_bar, textvariable=self.filter_plate_var, width=15).pack(side=tk.LEFT, padx=5)
         
         ttk.Label(filter_bar, text="Date:").pack(side=tk.LEFT, padx=5)
         self.filter_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
-        ttk.Entry(filter_bar, textvariable=self.filter_date_var, width=12).pack(side=tk.LEFT, padx=5)
+        self.date_entry = ttk.Entry(filter_bar, textvariable=self.filter_date_var, width=12)
+        self.date_entry.pack(side=tk.LEFT, padx=5)
+        self.date_entry.bind("<Button-1>", lambda e: self.show_calendar())
         
-        ttk.Button(filter_bar, text="Refresh Logs", command=self.load_history_logs).pack(side=tk.LEFT, padx=20)
+        ttk.Button(filter_bar, text="Search Logs", command=self.load_history_logs).pack(side=tk.LEFT, padx=15)
         
         # Log Table
         self.tree_frame = ttk.Frame(logs_container)
         self.tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        columns = ("time", "id", "type", "direction", "plate", "conf")
+        columns = ("id", "type", "plate", "direction", "time", "conf")
         self.tree = ttk.Treeview(self.tree_frame, columns=columns, show="headings", height=20)
         
-        self.tree.heading("time", text="Timestamp")
         self.tree.heading("id", text="Track ID")
         self.tree.heading("type", text="Vehicle Type")
-        self.tree.heading("direction", text="Direction")
         self.tree.heading("plate", text="License Plate")
+        self.tree.heading("direction", text="Direction")
+        self.tree.heading("time", text="Timestamp")
         self.tree.heading("conf", text="Confidence")
         
-        self.tree.column("time", width=150)
         self.tree.column("id", width=80)
         self.tree.column("type", width=100)
-        self.tree.column("direction", width=100)
         self.tree.column("plate", width=150)
+        self.tree.column("direction", width=100)
+        self.tree.column("time", width=200)
         self.tree.column("conf", width=100)
         
         self.tree_scroll = ttk.Scrollbar(self.tree_frame, orient="vertical", command=self.tree.yview)
@@ -588,10 +598,10 @@ class VehicleCounterApp:
 
 
     def enable_ui(self):
+        self.start_btn.config(state=tk.NORMAL)
+        # self.connect_btn.config(state=tk.NORMAL) # Removed in tabbed layout
         self.browse_btn.config(state=tk.NORMAL)
-        self.connect_btn.config(state=tk.NORMAL)
-        if self.file_path.get():
-            self.start_btn.config(state=tk.NORMAL)
+        self.update_status("Model Ready")
 
     def browse_file(self):
         path = filedialog.askopenfilename(filetypes=[("Video/Image", "*.mp4 *.avi *.jpg *.png *.mkv")])
@@ -686,10 +696,118 @@ class VehicleCounterApp:
         """Periodically check DB for new logs to update the Treeview if we are in Tab 2"""
         if self.notebook.index("current") == 1: # Tab index 1 is Logs
             self.load_history_logs()
+            self.refresh_vehicle_types()
         self.root.after(5000, self.poll_db_logs)
 
+    def refresh_vehicle_types(self):
+        """Update the ComboBox with unique vehicle types from DB"""
+        try:
+            self.cursor.execute("SELECT DISTINCT vehicle_type FROM vehicle_logs ORDER BY vehicle_type")
+            types = [r[0].capitalize() for r in self.cursor.fetchall() if r[0]]
+            current_values = list(self.filter_type_combo['values'])
+            new_values = ["All"] + sorted(list(set(types)))
+            if set(current_values) != set(new_values):
+                self.filter_type_combo['values'] = new_values
+        except:
+            pass
+
+    def show_calendar(self):
+        """Show a visual calendar picker popup"""
+        top = tk.Toplevel(self.root)
+        top.title("Select Date")
+        top.geometry("300x320")
+        top.resizable(False, False)
+        top.transient(self.root)
+        top.grab_set()
+        
+        # Center popup
+        x = self.root.winfo_x() + 100
+        y = self.root.winfo_y() + 100
+        top.geometry(f"+{x}+{y}")
+        
+        # State for month/year
+        try:
+            current_date = datetime.strptime(self.filter_date_var.get(), "%Y-%m-%d")
+        except:
+            current_date = datetime.now()
+            
+        month_var = tk.IntVar(value=current_date.month)
+        year_var = tk.IntVar(value=current_date.year)
+        
+        def refresh_calendar():
+            # Clear previous grid
+            for child in calendar_frame.winfo_children():
+                child.destroy()
+            
+            m = month_var.get()
+            y = year_var.get()
+            
+            # Header
+            header_str = f"{calendar.month_name[m]} {y}"
+            header_label.config(text=header_str)
+            
+            # Weekdays
+            days_labels = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+            for i, day in enumerate(days_labels):
+                lbl = ttk.Label(calendar_frame, text=day, font=("Segoe UI", 9, "bold"))
+                lbl.grid(row=0, column=i, pady=5)
+            
+            # Days
+            month_cal = calendar.monthcalendar(y, m)
+            for row_idx, week in enumerate(month_cal):
+                for col_idx, day in enumerate(week):
+                    if day != 0:
+                        btn = tk.Button(calendar_frame, text=str(day), width=4, 
+                                        relief="flat", bg="white", activebackground="#0056b3",
+                                        activeforeground="white")
+                        btn.grid(row=row_idx+1, column=col_idx, padx=2, pady=2)
+                        
+                        # Selection logic
+                        date_str = f"{y}-{m:02d}-{day:02d}"
+                        if date_str == self.filter_date_var.get():
+                             btn.config(bg="#e1e1e1", fg="#0056b3", font=("Segoe UI", 9, "bold"))
+                        
+                        btn.config(command=lambda d=date_str: select_date(d))
+
+        def select_date(d):
+            self.filter_date_var.set(d)
+            top.destroy()
+            self.load_history_logs()
+
+        def prev_month():
+            m = month_var.get() - 1
+            if m < 1:
+                month_var.set(12)
+                year_var.set(year_var.get() - 1)
+            else:
+                month_var.set(m)
+            refresh_calendar()
+
+        def next_month():
+            m = month_var.get() + 1
+            if m > 12:
+                month_var.set(1)
+                year_var.set(year_var.get() + 1)
+            else:
+                month_var.set(m)
+            refresh_calendar()
+
+        # UI Layout
+        nav_frame = ttk.Frame(top, padding=10)
+        nav_frame.pack(fill=tk.X)
+        
+        ttk.Button(nav_frame, text="<", width=3, command=prev_month).pack(side=tk.LEFT)
+        header_label = ttk.Label(nav_frame, text="", font=("Segoe UI", 10, "bold"))
+        header_label.pack(side=tk.LEFT, expand=True)
+        ttk.Button(nav_frame, text=">", width=3, command=next_month).pack(side=tk.LEFT)
+        
+        calendar_frame = ttk.Frame(top, padding=10)
+        calendar_frame.pack(fill=tk.BOTH, expand=True)
+        
+        refresh_calendar()
+
     def load_history_logs(self):
-        """Fetch logs from DB based on filter"""
+        """Fetch logs from DB based on filters with AM/PM and specific column order"""
         try:
             # Clear tree
             for item in self.tree.get_children():
@@ -697,31 +815,38 @@ class VehicleCounterApp:
                 
             v_type = self.filter_type_var.get()
             date_filter = self.filter_date_var.get()
+            plate_filter = self.filter_plate_var.get()
             
-            query = "SELECT timestamp, track_id, vehicle_type, direction, plate_number, confidence FROM vehicle_logs WHERE timestamp LIKE ?"
+            # Select columns in specific order: track_id, vehicle_type, plate_number, direction, timestamp, confidence
+            query = "SELECT track_id, vehicle_type, plate_number, direction, timestamp, confidence FROM vehicle_logs WHERE timestamp LIKE ?"
             params = [f"{date_filter}%"]
             
             if v_type != "All":
                 query += " AND vehicle_type = ?"
                 params.append(v_type.lower())
+            
+            if plate_filter:
+                query += " AND plate_number LIKE ?"
+                params.append(f"%{plate_filter.upper()}%")
                 
-            query += " ORDER BY timestamp DESC LIMIT 100"
+            query += " ORDER BY timestamp DESC LIMIT 200"
             
             self.cursor.execute(query, params)
             rows = self.cursor.fetchall()
             
             for row in rows:
-                # Format confidence as %
                 display_row = list(row)
                 
-                # Format Timestamp from "YYYY-MM-DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS AM/PM"
+                # Format Timestamp (Original is at index 4)
                 try:
-                    dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-                    display_row[0] = dt.strftime("%Y-%m-%d %I:%M:%S %p")
+                    dt = datetime.strptime(row[4], "%Y-%m-%d %H:%M:%S")
+                    display_row[4] = dt.strftime("%Y-%m-%d %I:%M:%S %p")
                 except:
                     pass
                 
+                # Format Confidence (Original is at index 5)
                 display_row[5] = f"{row[5]*100:.1f}%"
+                
                 self.tree.insert("", tk.END, values=display_row)
         except Exception as e:
             logger.error(f"Error loading history: {e}")

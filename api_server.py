@@ -39,6 +39,7 @@ if os.path.exists("dashboard"):
 def get_logs(
     limit: int = 100, 
     vehicle_type: str = None,
+    plate_number: str = None,
     start_date: str = None,
     end_date: str = None,
     start_time: str = "00:00:00",
@@ -51,8 +52,12 @@ def get_logs(
         params = []
         
         if vehicle_type and vehicle_type != "All":
-            query += " AND vehicle_type = ?"
-            params.append(vehicle_type)
+            query += " AND vehicle_type LIKE ?"
+            params.append(f"%{vehicle_type.lower()}%")
+            
+        if plate_number:
+            query += " AND plate_number LIKE ?"
+            params.append(f"%{plate_number.upper()}%")
             
         if start_date:
             query += " AND timestamp >= ?"
@@ -107,6 +112,18 @@ def get_stats():
             "summary": df.to_dict(orient="records"),
             "by_type": df_types.to_dict(orient="records")
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/vehicle-types")
+def get_vehicle_types():
+    """Get unique vehicle types from logs"""
+    try:
+        conn = get_db_connection()
+        query = "SELECT DISTINCT vehicle_type FROM vehicle_logs ORDER BY vehicle_type"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df["vehicle_type"].tolist()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

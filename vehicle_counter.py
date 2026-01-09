@@ -16,6 +16,9 @@ from collections import deque
 from tkinter.scrolledtext import ScrolledText
 import sqlite3
 from datetime import datetime
+import easyocr
+import cv2
+import urllib.parse
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,6 +76,44 @@ class ZoneConfigDialog(tk.Toplevel):
         except ValueError:
             pass # Ignore incomplete input
 
+def sanitize_rtsp_url(url):
+    """
+    Sanitize RTSP URL by encoding special characters in the password.
+    Example: rtsp://admin:pydah@123@192.168.1.1 -> rtsp://admin:pydah%40123@192.168.1.1
+    """
+    if not isinstance(url, str) or not url.startswith('rtsp://'):
+        return url
+    
+    try:
+        # Basic structure: rtsp://[user[:password]@]host[:port]/path
+        prefix = 'rtsp://'
+        url_stripped = url[len(prefix):]
+        
+        if '@' not in url_stripped:
+            return url
+            
+        # The last '@' before the host/path part separates credentials
+        # We split by '@' from the right to isolate the credentials from the host part
+        parts = url_stripped.rsplit('@', 1)
+        if len(parts) != 2:
+            return url
+            
+        creds, host_part = parts
+        
+        if ':' in creds:
+            user, password = creds.split(':', 1)
+            # Only encode password if it's not already encoded
+            if '%' not in password:
+                encoded_password = urllib.parse.quote(password)
+                sanitized = f"{prefix}{user}:{encoded_password}@{host_part}"
+                logger.info(f"RTSP URL sanitized (password encoded)")
+                return sanitized
+        
+        return url
+    except Exception as e:
+        logger.error(f"Error sanitizing RTSP URL: {e}")
+        return url
+
 class VideoProcessor:
     """
     Handles video capture and model inference in a separate thread.
@@ -89,21 +130,51 @@ class VideoProcessor:
     def run(self):
         try:
             logger.info(f"Starting VideoProcessor with source: {self.source}")
-            self.cap = cv2.VideoCapture(self.source)
-            if not self.cap.isOpened():
-                raise Exception(f"Could not open video source: {self.source}")
             
-            # Optimization for RTSP
+            # Sanitize source if it's an RTSP URL
+            proc_source = sanitize_rtsp_url(self.source)
+            if proc_source != self.source:
+                logger.info(f"Sanitized RTSP source: {proc_source}")
+
+            # Optimization for RTSP - SET BEFORE VideoCapture
             if isinstance(self.source, str) and self.source.startswith('rtsp://'):
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # Force TCP to avoid packet loss issues and artifacts (green screen)
+                # These must be set before starting the capture
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+                logger.info("RTSP Optimization: Forcing TCP transport and 5s timeout")
+
+            # Try to use FFMPEG backend explicitly for better RTSP support
+            self.cap = cv2.VideoCapture(proc_source, cv2.CAP_FFMPEG)
+            if not self.cap.isOpened():
+                raise Exception(f"Could not open video source: {proc_source}")
+            
+            # Set buffer size (some backends allow this after open)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             frame_count = 0
+            retry_count = 0
+            max_retries = 30 # Allow some retries for RTSP glitches
             
             while not self.stop_event.is_set():
                 ret, frame = self.cap.read()
                 if not ret:
-                    logger.info("End of video reached")
-                    break
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        if retry_count % 5 == 0:
+                            logger.warning(f"RTSP Glitch: Retrying frame read ({retry_count}/{max_retries})...")
+                            # If many consecutive failures, try to re-open the stream
+                            if retry_count >= 15:
+                                logger.info("Heavy corruption detected, re-opening stream...")
+                                self.cap.release()
+                                time.sleep(1.0)
+                                self.cap = cv2.VideoCapture(proc_source, cv2.CAP_FFMPEG)
+                        time.sleep(0.1)
+                        continue
+                    else:
+                        logger.info("End of video reached or connection lost")
+                        break
+                
+                retry_count = 0 # Reset on success
 
                 # Skip frames if queue is full to prevent lag
                 if self.result_queue.full():
@@ -152,7 +223,10 @@ class VehicleCounterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AI Vehicle Counter - Robust Threading")
-        self.root.geometry("1100x800")
+        self.root.geometry("1200x900")
+        
+        # Configure Styles
+        self.setup_styles()
         
         # Check for CUDA        # Data
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -165,6 +239,7 @@ class VehicleCounterApp:
         self.stop_event = threading.Event()
         self.result_queue = queue.Queue(maxsize=2) # Small buffer to keep latency low
         self.is_running = False
+        self.current_source = None # Track the active source (video/image)
         
         # Stats
         # Counting State
@@ -192,82 +267,123 @@ class VehicleCounterApp:
         # Database Initialization
         self.init_db()
         
+        # Initialize OCR in background
+        self.reader = None
+        threading.Thread(target=self.init_ocr, daemon=True).start()
+        
         # UI
         self.create_widgets()
         self.update_status("Initializing... Loading Model...")
         
+        # Start DB Polling for logs
+        self.poll_db_logs()
+        
         # Load Model Async
-        threading.Thread(target=self.load_model, daemon=True).start()
+        initial_model = 'models/custom_model.pt' if os.path.exists('models/custom_model.pt') else 'models/yolov8n.pt'
+        threading.Thread(target=self.load_model, args=(initial_model,), daemon=True).start()
+
+    def setup_styles(self):
+        style = ttk.Style()
+        style.theme_use('vista') # Use a more native Windows look
+        
+        # Colors - Light Theme
+        bg_light = "#f0f0f0"
+        fg_dark = "#000000"
+        accent = "#0056b3"
+        
+        style.configure("TFrame", background=bg_light)
+        style.configure("TLabel", background=bg_light, foreground=fg_dark, font=("Segoe UI", 10))
+        style.configure("TButton", padding=5)
+        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground=accent)
+        
+        # Notebook Style (Tabs)
+        style.configure("TNotebook", background=bg_light, borderwidth=1)
+        style.configure("TNotebook.Tab", padding=[15, 5], font=("Segoe UI", 10))
+        style.map("TNotebook.Tab", 
+                  background=[("selected", "white"), ("!selected", "#e1e1e1")], 
+                  foreground=[("selected", accent), ("!selected", fg_dark)])
+        
+        # Treeview (Log Table)
+        style.configure("Treeview", background="white", foreground="black", fieldbackground="white", rowheight=25)
+        style.map("Treeview", background=[("selected", accent)], foreground=[("selected", "white")])
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        
+    def init_ocr(self):
+        try:
+            logger.info("Initializing EasyOCR (Background)...")
+            self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+            logger.info("EasyOCR Initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize EasyOCR: {e}")
+            self.reader = None
 
     def create_widgets(self):
-        # Main Layout
+        self.root.state('zoomed')
+        
+        # Main Theme background
+        self.root.configure(bg="#f0f0f0")
+        
+        # Header
+        header_frame = ttk.Frame(self.root)
+        header_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        logo_lbl = ttk.Label(header_frame, text="GATE SYSTEM - VEHICLE TRACKER", style="Header.TLabel")
+        logo_lbl.pack(side=tk.LEFT)
+        
+        # Tabbed Layout
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # --- TAB 1: Live View ---
+        self.live_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.live_tab, text="  LIVE DASHBOARD  ")
+        
+        live_container = ttk.Frame(self.live_tab)
+        live_container.pack(fill=tk.BOTH, expand=True)
+        
         # Left: Video
-        # Right: Controls & Stats
-        
-        self.root.state('zoomed') # Maximize
-        
-        main_container = ttk.Frame(self.root)
-        main_container.pack(fill=tk.BOTH, expand=True)
-        
-        # Left Side - Video
-        self.video_frame = ttk.Frame(main_container)
+        self.video_frame = ttk.Frame(live_container)
         self.video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        self.canvas = tk.Canvas(self.video_frame, bg='black')
+        self.canvas = tk.Canvas(self.video_frame, bg='black', highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        
-        # Zone Events
         self.canvas.bind("<Double-Button-1>", self.open_zone_dialog)
-
-        # Right Side - Controls
-        right_panel = ttk.Frame(main_container, width=300)
-        right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+        
+        # Right: Quick Controls & Live Stats
+        live_right_panel = ttk.Frame(live_container, width=350)
+        live_right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=5)
         
         # Controls Group
-        self.controls_frame = ttk.LabelFrame(right_panel, text="Controls", padding=10)
+        self.controls_frame = ttk.LabelFrame(live_right_panel, text="Camera & Source", padding=15)
         self.controls_frame.pack(fill=tk.X, pady=5)
         
-        # File Selection
-        ttk.Label(self.controls_frame, text="Video File:").pack(anchor=tk.W)
-        file_Box = ttk.Frame(self.controls_frame)
-        file_Box.pack(fill=tk.X, pady=5)
+        ttk.Label(self.controls_frame, text="Video Source:").pack(anchor=tk.W)
+        source_box = ttk.Frame(self.controls_frame)
+        source_box.pack(fill=tk.X, pady=5)
         
         self.file_path = tk.StringVar()
-        ttk.Entry(file_Box, textvariable=self.file_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(file_Box, text="Browse", command=self.browse_file).pack(side=tk.RIGHT, padx=5)
+        ttk.Entry(source_box, textvariable=self.file_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.browse_btn = ttk.Button(source_box, text="...", width=3, command=self.browse_file)
+        self.browse_btn.pack(side=tk.RIGHT, padx=2)
         
-        # RTSP
-        ttk.Label(self.controls_frame, text="RTSP Camera:").pack(anchor=tk.W, pady=(10, 0))
-        rtsp_box = ttk.Frame(self.controls_frame)
-        rtsp_box.pack(fill=tk.X, pady=5)
-        
+        ttk.Label(self.controls_frame, text="RTSP URL:").pack(anchor=tk.W, pady=(10, 0))
         self.rtsp_url = tk.StringVar(value="rtsp://")
-        ttk.Entry(rtsp_box, textvariable=self.rtsp_url).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(rtsp_box, text="Connect", command=self.start_rtsp).pack(side=tk.RIGHT, padx=5)
+        ttk.Entry(self.controls_frame, textvariable=self.rtsp_url).pack(fill=tk.X, pady=5)
         
-        # Buttons
         btn_box = ttk.Frame(self.controls_frame)
-        btn_box.pack(fill=tk.X, pady=15)
-        self.start_btn = ttk.Button(btn_box, text="Start Processing", command=self.start_file_processing, state=tk.DISABLED)
-        self.start_btn.pack(fill=tk.X, pady=2)
+        btn_box.pack(fill=tk.X, pady=10)
+        self.start_btn = ttk.Button(btn_box, text="START SYSTEM", command=self.start_file_processing, state=tk.DISABLED)
+        self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(btn_box, text="STOP", command=self.stop_processing).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         
-        ttk.Button(btn_box, text="Stop", command=self.stop_processing).pack(fill=tk.X, pady=2)
+        # Live Stats Group
+        self.stats_frame = ttk.LabelFrame(live_right_panel, text="Real-Time Detection", padding=15)
+        self.stats_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         
-        # Model Selection
-        self.load_model_btn = ttk.Button(btn_box, text="Load Custom Model", command=self.load_custom_model)
-        self.load_model_btn.pack(fill=tk.X, pady=(10, 2))
-        
-        # Statistics Group
-        self.stats_frame = ttk.LabelFrame(right_panel, text="Live Statistics", padding=10)
-        self.stats_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Create Labels for classes
-        # Create Labels for classes - Dynamic now
         self.count_labels = {}
-        # classes will be populated on model load
         
         # Add scrollable canvas for stats if many classes
-        self.stats_canvas = tk.Canvas(self.stats_frame, height=300)
+        self.stats_canvas = tk.Canvas(self.stats_frame, height=300, bg="#f0f0f0", highlightthickness=0)
         self.stats_scrollbar = ttk.Scrollbar(self.stats_frame, orient="vertical", command=self.stats_canvas.yview)
         self.scrollable_stats_frame = ttk.Frame(self.stats_canvas)
         
@@ -287,8 +403,58 @@ class VehicleCounterApp:
 
             
         # FPS Label at bottom of right panel
-        self.fps_label = ttk.Label(right_panel, text="FPS: 0.0", font=("Arial", 10))
+        self.fps_label = ttk.Label(live_right_panel, text="FPS: 0.0", font=("Arial", 10))
         self.fps_label.pack(side=tk.BOTTOM, pady=10)
+        
+        # --- TAB 2: LOGS & HISTORY ---
+        self.logs_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.logs_tab, text="  GATE LOGS / HISTORY  ")
+        
+        logs_container = ttk.Frame(self.logs_tab)
+        logs_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Filter Bar
+        filter_bar = ttk.Frame(logs_container)
+        filter_bar.pack(fill=tk.X, pady=(0, 15))
+        
+        ttk.Label(filter_bar, text="Filter Type:").pack(side=tk.LEFT, padx=5)
+        self.filter_type_var = tk.StringVar(value="All")
+        self.filter_type_combo = ttk.Combobox(filter_bar, textvariable=self.filter_type_var, width=15)
+        self.filter_type_combo['values'] = ("All", "Car", "Truck", "Bus", "Motorcycle")
+        self.filter_type_combo.pack(side=tk.LEFT, padx=10)
+        
+        ttk.Label(filter_bar, text="Date:").pack(side=tk.LEFT, padx=5)
+        self.filter_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        ttk.Entry(filter_bar, textvariable=self.filter_date_var, width=12).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(filter_bar, text="Refresh Logs", command=self.load_history_logs).pack(side=tk.LEFT, padx=20)
+        
+        # Log Table
+        self.tree_frame = ttk.Frame(logs_container)
+        self.tree_frame.pack(fill=tk.BOTH, expand=True)
+        
+        columns = ("time", "id", "type", "direction", "plate", "conf")
+        self.tree = ttk.Treeview(self.tree_frame, columns=columns, show="headings", height=20)
+        
+        self.tree.heading("time", text="Timestamp")
+        self.tree.heading("id", text="Track ID")
+        self.tree.heading("type", text="Vehicle Type")
+        self.tree.heading("direction", text="Direction")
+        self.tree.heading("plate", text="License Plate")
+        self.tree.heading("conf", text="Confidence")
+        
+        self.tree.column("time", width=150)
+        self.tree.column("id", width=80)
+        self.tree.column("type", width=100)
+        self.tree.column("direction", width=100)
+        self.tree.column("plate", width=150)
+        self.tree.column("conf", width=100)
+        
+        self.tree_scroll = ttk.Scrollbar(self.tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=self.tree_scroll.set)
+        
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
         # Status Bar at very bottom
         self.status_var = tk.StringVar(value="Ready")
@@ -353,24 +519,31 @@ class VehicleCounterApp:
                     vehicle_type TEXT,
                     track_id INTEGER,
                     direction TEXT,
-                    confidence REAL
+                    confidence REAL,
+                    plate_number TEXT
                 )
             ''')
-            self.conn.commit()
-            logger.info("Database initialized: gate_log.db")
+            # Migration: Add plate_number if it doesn't exist
+            try:
+                self.cursor.execute('ALTER TABLE vehicle_logs ADD COLUMN plate_number TEXT')
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                pass # Column already exists
+            
+            logger.info("Database initialized with plate_number support")
         except Exception as e:
             logger.error(f"Database error: {e}")
 
-    def log_to_db(self, vehicle_type, track_id, direction, confidence):
+    def log_to_db(self, vehicle_type, track_id, direction, confidence, plate_number=None):
         """Save a detection event to the database"""
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.cursor.execute('''
-                INSERT INTO vehicle_logs (timestamp, vehicle_type, track_id, direction, confidence)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (timestamp, vehicle_type, track_id, direction, confidence))
+                INSERT INTO vehicle_logs (timestamp, vehicle_type, track_id, direction, confidence, plate_number)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (timestamp, vehicle_type, track_id, direction, confidence, plate_number))
             self.conn.commit()
-            logger.info(f"DB Log: {vehicle_type} #{track_id} {direction}")
+            logger.info(f"DB Log: {vehicle_type} #{track_id} {direction} {f'[{plate_number}]' if plate_number else ''}")
         except Exception as e:
             logger.error(f"Failed to log to DB: {e}")
 
@@ -464,6 +637,7 @@ class VehicleCounterApp:
         self.start_processing(url)
 
     def start_processing(self, source):
+        self.current_source = source
         if self.is_running:
             self.stop_processing()
             
@@ -508,6 +682,50 @@ class VehicleCounterApp:
         self.is_running = False
         self.update_status("Stopped.")
 
+    def poll_db_logs(self):
+        """Periodically check DB for new logs to update the Treeview if we are in Tab 2"""
+        if self.notebook.index("current") == 1: # Tab index 1 is Logs
+            self.load_history_logs()
+        self.root.after(5000, self.poll_db_logs)
+
+    def load_history_logs(self):
+        """Fetch logs from DB based on filter"""
+        try:
+            # Clear tree
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+                
+            v_type = self.filter_type_var.get()
+            date_filter = self.filter_date_var.get()
+            
+            query = "SELECT timestamp, track_id, vehicle_type, direction, plate_number, confidence FROM vehicle_logs WHERE timestamp LIKE ?"
+            params = [f"{date_filter}%"]
+            
+            if v_type != "All":
+                query += " AND vehicle_type = ?"
+                params.append(v_type.lower())
+                
+            query += " ORDER BY timestamp DESC LIMIT 100"
+            
+            self.cursor.execute(query, params)
+            rows = self.cursor.fetchall()
+            
+            for row in rows:
+                # Format confidence as %
+                display_row = list(row)
+                
+                # Format Timestamp from "YYYY-MM-DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS AM/PM"
+                try:
+                    dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                    display_row[0] = dt.strftime("%Y-%m-%d %I:%M:%S %p")
+                except:
+                    pass
+                
+                display_row[5] = f"{row[5]*100:.1f}%"
+                self.tree.insert("", tk.END, values=display_row)
+        except Exception as e:
+            logger.error(f"Error loading history: {e}")
+
     def poll_results(self):
         if not self.is_running:
             return
@@ -529,6 +747,37 @@ class VehicleCounterApp:
         finally:
             if self.is_running:
                 self.root.after(10, self.poll_results)
+
+    def get_plate_number(self, frame, box):
+        """Extract and OCR license plate from a vehicle box"""
+        if self.reader is None:
+             return "No OCR"
+             
+        try:
+            # Get coordinates
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            
+            # Crop vehicle
+            vehicle_img = frame[y1:y2, x1:x2]
+            
+            # Simple heuristic: License plates are usually in the lower 60% of the vehicle
+            h, w = vehicle_img.shape[:2]
+            crop_top = int(h * 0.4)
+            plate_area = vehicle_img[crop_top:h, :]
+            
+            # Run OCR
+            # detail=0 means just return text
+            result = self.reader.readtext(plate_area, detail=0, paragraph=True)
+            
+            if result:
+                # Clean up text (remove spaces, special chars)
+                text = "".join(result).replace(" ", "").upper()
+                # Basic plate validation (length check etc can be added)
+                return text[:15] # Limit length
+            return "Unknown"
+        except Exception as e:
+            logger.error(f"OCR Error: {e}")
+            return "Error"
 
     def update_stats(self, results, frame):
         current_counts = defaultdict(int)
@@ -555,6 +804,34 @@ class VehicleCounterApp:
                 
                 # Check if currently in zone
                 in_zone = self.is_in_zone(cx, cy)
+                
+                # Draw the Crossing Line (Visual Only)
+                if len(self.zone_points) == 2:
+                    z_x1_c, z_y1_c = self.zone_points[0]
+                    z_x2_c, z_y2_c = self.zone_points[1]
+                    line_y_canvas = (z_y1_c + z_y2_c) // 2
+                    cv2.line(frame, (int(z_x1_c), int(line_y_canvas)), (int(z_x2_c), int(line_y_canvas)), (255, 255, 0), 2)
+                    cv2.putText(frame, "CROSSING LINE", (int(z_x1_c), int(line_y_canvas)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+                
+                # SPECIAL CASE: Single Image Processing
+                # Check if currently processing an image
+                is_image = False
+                if hasattr(self, 'current_source') and self.current_source:
+                    is_image = str(self.current_source).lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+                
+                if is_image and in_zone:
+                    # For images, YOLO might not give a track_id. Use 999 as placeholder.
+                    track_id = int(box.id[0].item()) if box.id is not None else 999
+                    if label not in self.counted_ids:
+                         self.counted_ids[label] = {'in': set(), 'out': set(), 'stationary': set()}
+                    
+                    if track_id not in self.counted_ids[label]['stationary']:
+                         self.counted_ids[label]['stationary'].add(track_id)
+                         plate_number = self.get_plate_number(frame, box)
+                         self.log_to_db(label, track_id, "STATIONARY", float(box.conf[0].item()), plate_number)
+                         logger.info(f"Image Detection: {label} Plate: {plate_number}")
+
                 
                 # Prepare label
                 text = f"{label}"
@@ -595,6 +872,10 @@ class VehicleCounterApp:
                          # Update Track Data
                          # Only consider points roughly within X-bounds (prevent cross-lane counting)
                          if min_x <= cx <= max_x:
+                             # Initialize for new labels if not already done
+                             if label not in self.counted_ids:
+                                 self.counted_ids[label] = {'in': set(), 'out': set()}
+
                              t_data = self.track_data[track_id]
                              t_data['min_y'] = min(t_data['min_y'], cy)
                              t_data['max_y'] = max(t_data['max_y'], cy)
@@ -614,18 +895,22 @@ class VehicleCounterApp:
                                  if delta > 0:
                                      if track_id not in self.counted_ids[label]['in']:
                                         self.counted_ids[label]['in'].add(track_id)
+                                        # Call OCR
+                                        plate_number = self.get_plate_number(frame, box)
                                         # Log to Database
-                                        self.log_to_db(label, track_id, "IN", float(box.conf[0].item()))
-                                        logger.info(f"Counted IN: {label} #{track_id}")
+                                        self.log_to_db(label, track_id, "IN", float(box.conf[0].item()), plate_number)
+                                        logger.info(f"Counted IN: {label} #{track_id} Plate: {plate_number}")
                                  
                                  # OUT: Moving Up (negative delta)
                                  # Use a threshold to avoid jitter
                                  elif delta < 0:
                                      if track_id not in self.counted_ids[label]['out']:
                                         self.counted_ids[label]['out'].add(track_id)
+                                        # Call OCR
+                                        plate_number = self.get_plate_number(frame, box)
                                         # Log to Database
-                                        self.log_to_db(label, track_id, "OUT", float(box.conf[0].item()))
-                                        logger.info(f"Counted OUT: {label} #{track_id}")
+                                        self.log_to_db(label, track_id, "OUT", float(box.conf[0].item()), plate_number)
+                                        logger.info(f"Counted OUT: {label} #{track_id} Plate: {plate_number}")
 
                     # Update position
                     self.prev_positions[track_id] = (cx, cy)

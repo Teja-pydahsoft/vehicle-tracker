@@ -6,7 +6,7 @@ def view_logs():
     try:
         conn = sqlite3.connect('gate_log.db')
         # Format the query to get the last 20 entries
-        query = "SELECT * FROM vehicle_logs ORDER BY timestamp DESC LIMIT 20"
+        query = "SELECT timestamp, vehicle_type, track_id, direction, plate_number FROM vehicle_logs ORDER BY timestamp DESC LIMIT 20"
         df = pd.read_sql_query(query, conn)
         
         if df.empty:

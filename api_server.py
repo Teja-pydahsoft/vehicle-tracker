@@ -3,6 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
+import os
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 app = FastAPI(title="Smart Gate API", description="API to access vehicle detection logs")
 
@@ -23,25 +26,51 @@ def get_db_connection():
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "Smart Gate API is running"}
+    """Serve the dashboard index file"""
+    if os.path.exists("dashboard/index.html"):
+        return FileResponse("dashboard/index.html")
+    return {"status": "online", "message": "Smart Gate API is running, but dashboard/index.html was not found"}
+
+# Mount the static files (CSS, JS, images)
+if os.path.exists("dashboard"):
+    app.mount("/static", StaticFiles(directory="dashboard"), name="static")
 
 @app.get("/logs")
-def get_logs(limit: int = 100, vehicle_type: str = None):
+def get_logs(
+    limit: int = 100, 
+    vehicle_type: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    start_time: str = "00:00:00",
+    end_time: str = "23:59:59"
+):
     """Get vehicle detection logs with optional filtering"""
     try:
         conn = get_db_connection()
-        query = "SELECT * FROM vehicle_logs"
+        query = "SELECT * FROM vehicle_logs WHERE 1=1"
         params = []
         
-        if vehicle_type:
-            query += " WHERE vehicle_type = ?"
+        if vehicle_type and vehicle_type != "All":
+            query += " AND vehicle_type = ?"
             params.append(vehicle_type)
+            
+        if start_date:
+            query += " AND timestamp >= ?"
+            params.append(f"{start_date} {start_time}")
+            
+        if end_date:
+            query += " AND timestamp <= ?"
+            params.append(f"{end_date} {end_time}")
             
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
         
         df = pd.read_sql_query(query, conn, params=params)
         conn.close()
+        
+        # Replace NaN with empty string for cleaner JSON
+        df = df.fillna("")
+        
         return df.to_dict(orient="records")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

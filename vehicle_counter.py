@@ -21,6 +21,15 @@ import easyocr
 import cv2
 import urllib.parse
 import calendar
+import requests
+import subprocess
+import tempfile
+import zipfile
+import shutil
+
+# Application Versioning
+CURRENT_VERSION = "v1.0.1" 
+GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -342,10 +351,111 @@ class VehicleCounterApp:
         # Start DB Polling for logs
         self.poll_db_logs()
         
+        # Check for Updates (New Feature)
+        self.root.after(2000, self.check_for_updates)
+        
         # Load Model Async
         # Force usage of standard YOLOv8n model
         initial_model = 'yolov8n.pt'
         threading.Thread(target=self.load_model, args=(initial_model,), daemon=True).start()
+
+    def check_for_updates(self):
+        """Check GitHub for new releases"""
+        if not getattr(sys, 'frozen', False):
+            return # Only update frozen exe
+            
+        try:
+            logger.info("Checking for updates...")
+            api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            response = requests.get(api_url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                latest_version = data.get('tag_name', '')
+                
+                if latest_version and latest_version != CURRENT_VERSION:
+                    logger.info(f"Update available: {latest_version}")
+                    msg = f"A new version ({latest_version}) is available!\n\nCurrent Version: {CURRENT_VERSION}\n\nDo you want to download and update now?"
+                    if messagebox.askyesno("Update Available", msg):
+                        # Find asset
+                        assets = data.get('assets', [])
+                        download_url = None
+                        for asset in assets:
+                            if asset['name'].endswith('.zip') and 'VehicleCounter' in asset['name']:
+                                download_url = asset['browser_download_url']
+                                break
+                        
+                        if download_url:
+                            self.perform_update(download_url, latest_version)
+                        else:
+                            messagebox.showerror("Update Error", "Could not find a valid update file in the release.")
+            
+        except Exception as e:
+            logger.error(f"Update check failed: {e}")
+
+    def perform_update(self, url, version):
+        """Download and install update"""
+        try:
+            self.update_status(f"Downloading update {version}...")
+            
+            # 1. Download Zip
+            r = requests.get(url, stream=True)
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, "update.zip")
+            
+            with open(zip_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            self.update_status("Installing update...")
+            
+            # 2. Extract
+            extract_path = os.path.join(temp_dir, "extracted")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
+            
+            # 3. Find inner folder if nested (e.g. dist/VehicleCounter)
+            # We assume the zip contains the CONTENTS of the app folder or the folder itself
+            # Let's find the exe to be sure
+            new_exe_path = None
+            source_root = extract_path
+            
+            for root, dirs, files in os.walk(extract_path):
+                if "VehicleCounter.exe" in files:
+                    source_root = root
+                    new_exe_path = os.path.join(root, "VehicleCounter.exe")
+                    break
+            
+            if not new_exe_path:
+                raise Exception("Invalid update package: VehicleCounter.exe not found")
+
+            # 4. Create Updater Batch Script
+            # We need to close this app, wait, delete old files, copy new files, restart
+            current_exe = sys.executable
+            current_dir = os.path.dirname(current_exe)
+            
+            updater_bat = os.path.join(temp_dir, "updater.bat")
+            
+            bat_content = f"""
+@echo off
+echo Updating VehicleCounter to {version}...
+timeout /t 3 /nobreak > NUL
+echo Copying files...
+xcopy /E /H /Y "{source_root}\\*" "{current_dir}\\" > NUL
+echo Cleaning up...
+start "" "{current_exe}"
+del "{updater_bat}"
+"""
+            with open(updater_bat, 'w') as f:
+                f.write(bat_content)
+                
+            # 5. Launch Updater and Exit
+            subprocess.Popen([updater_bat], shell=True)
+            self.root.quit()
+            
+        except Exception as e:
+            logger.error(f"Update failed: {e}")
+            messagebox.showerror("Update Error", f"Failed to update: {e}")
 
     def setup_styles(self):
         style = ttk.Style()

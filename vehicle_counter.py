@@ -4,12 +4,13 @@ from PIL import Image, ImageTk
 import cv2
 import numpy as np
 import os
+import sys
 import time
 import queue
 import threading
 import torch
 from ultralytics import YOLO
-from collections import defaultdict
+from collections import defaultdict, Counter
 import psutil
 import logging
 from collections import deque
@@ -117,87 +118,146 @@ def sanitize_rtsp_url(url):
 
 class VideoProcessor:
     """
-    Handles video capture and model inference in a separate thread.
-    Produces results into a queue for the UI to consume.
+    Handles video capture and model inference.
+    Uses a separate reader thread to ensure RTSP stability and zero lag.
     """
-    def __init__(self, model, source, result_queue, stop_event, device='cpu'):
+    def __init__(self, model, source, result_queue, stop_event, device='cpu', start_frame=0):
         self.model = model
         self.source = source
         self.result_queue = result_queue
         self.stop_event = stop_event
         self.device = device
+        self.start_frame = start_frame
         self.cap = None
+        self.frame_buffer = queue.Queue(maxsize=1) # Only keep the freshest frame
     
-    def run(self):
+    def _reader(self):
+        """Dedicated thread for reading frames as fast as possible."""
         try:
-            logger.info(f"Starting VideoProcessor with source: {self.source}")
-            
-            # Sanitize source if it's an RTSP URL
+            logger.info(f"Starting Video Reader with source: {self.source}")
             proc_source = sanitize_rtsp_url(self.source)
-            if proc_source != self.source:
-                logger.info(f"Sanitized RTSP source: {proc_source}")
-
-            # Optimization for RTSP - SET BEFORE VideoCapture
-            if isinstance(self.source, str) and self.source.startswith('rtsp://'):
-                # Force TCP to avoid packet loss issues and artifacts (green screen)
-                # These must be set before starting the capture
+            
+            is_rtsp = isinstance(self.source, str) and self.source.startswith('rtsp://')
+            
+            if is_rtsp:
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
-                logger.info("RTSP Optimization: Forcing TCP transport and 5s timeout")
+                logger.info("RTSP Optimization: Forcing TCP transport")
+            else:
+                 # Clear RTSP options for local files to avoid issues
+                 if "OPENCV_FFMPEG_CAPTURE_OPTIONS" in os.environ:
+                     del os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]
 
-            # Try to use FFMPEG backend explicitly for better RTSP support
             self.cap = cv2.VideoCapture(proc_source, cv2.CAP_FFMPEG)
             if not self.cap.isOpened():
-                raise Exception(f"Could not open video source: {proc_source}")
-            
-            # Set buffer size (some backends allow this after open)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                logger.error(f"Could not open video source: {proc_source}")
+                return
 
-            frame_count = 0
+            # RESUME LOGIC: Seek to start frame if file
+            if not is_rtsp and self.start_frame > 0:
+                logger.info(f"Resuming video from frame {self.start_frame}")
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+
+            # Only set small buffer for RTSP to reduce latency. detailed file reading doesn't need this restrictive buffer.
+            if is_rtsp:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # Re-initialize frame buffer with small size for RTSP (Low Latency)
+                self.frame_buffer = queue.Queue(maxsize=2)
+            else:
+                # Re-initialize frame buffer with larger size for File (Smoothness)
+                self.frame_buffer = queue.Queue(maxsize=64)
+            
             retry_count = 0
             max_retries = 30 # Allow some retries for RTSP glitches
-            
+
             while not self.stop_event.is_set():
                 ret, frame = self.cap.read()
                 if not ret:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        if retry_count % 5 == 0:
-                            logger.warning(f"RTSP Glitch: Retrying frame read ({retry_count}/{max_retries})...")
-                            # If many consecutive failures, try to re-open the stream
-                            if retry_count >= 15:
-                                logger.info("Heavy corruption detected, re-opening stream...")
-                                self.cap.release()
-                                time.sleep(1.0)
-                                self.cap = cv2.VideoCapture(proc_source, cv2.CAP_FFMPEG)
-                        time.sleep(0.1)
-                        continue
+                    if is_rtsp:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            if retry_count % 5 == 0:
+                                logger.warning(f"RTSP Glitch: Retrying frame read ({retry_count}/{max_retries})...")
+                                if retry_count >= 15:
+                                    logger.info("Heavy corruption detected, re-opening stream...")
+                                    self.cap.release()
+                                    time.sleep(1.0)
+                                    self.cap = cv2.VideoCapture(proc_source, cv2.CAP_FFMPEG)
+                            time.sleep(0.05)
+                            continue
+                        else:
+                            logger.info("End of stream or connection lost")
+                            break
                     else:
-                        logger.info("End of video reached or connection lost")
-                        break
+                        # Local File: Loop video for testing
+                        logger.info("End of video file reached, re-starting logic...")
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
                 
-                retry_count = 0 # Reset on success
+                # Check current position for resume logic
+                # We can't easily push this back to main thread per frame, but we rely on main thread counting or inference
+                
+                retry_count = 0 
+                
+                if is_rtsp:
+                    # RTSP MODE: Drop frames if queue is full (Keep Real-Time)
+                    if not self.frame_buffer.full():
+                        self.frame_buffer.put(frame)
+                    else:
+                        try:
+                            self.frame_buffer.get_nowait() # Remove old
+                            self.frame_buffer.put(frame)   # Add new
+                        except: pass
+                else:
+                    # FILE MODE: BLOCK if queue is full (Process Every Frame)
+                    # This slows down the 'reader' to match 'processing' speed
+                    while not self.stop_event.is_set():
+                        try:
+                            self.frame_buffer.put(frame, timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue 
 
-                # Skip frames if queue is full to prevent lag
+
+        except Exception as e:
+            logger.error(f"Reader thread error: {e}")
+        finally:
+            if self.cap:
+                self.cap.release()
+            logger.info("Reader thread stopped")
+
+    def run(self):
+        # Start capture thread
+        reader_thread = threading.Thread(target=self._reader, daemon=True)
+        reader_thread.start()
+        
+        while not self.stop_event.is_set():
+            try:
+                # Wait for the next available frame (blocking with timeout)
+                try:
+                    frame = self.frame_buffer.get(timeout=1.0)
+                except queue.Empty:
+                    if not reader_thread.is_alive(): break
+                    continue
+
+                # Skip processing if queue is already full (keeps latency minimal)
                 if self.result_queue.full():
                     continue
 
                 # Run Inference
                 try:
                     start_time = time.time()
-                    # Use track() instead of predict() to get consistent IDs for counting
-                    # persist=True is important for video tracking
-                    # Use custom tracker config with high track_buffer to handle occlusions
                     results = self.model.track(
                         frame,
                         persist=True,
                         tracker='custom_tracker.yaml',
                         device=self.device,
                         verbose=False,
-                        imgsz=640,
-                        conf=0.25,
-                        iou=0.45,
+                        imgsz=640,  # Optimized for speed (Standard YOLO size)
+                        conf=0.25,  # Standard confidence
+                        iou=0.45,   # Standard IOU
                         half=(self.device == 'cuda'),
-                        max_det=100
+                        max_det=50,
+                        classes=[2, 3, 5, 7] # Filter: car, motorcycle, bus, truck
                     )
                     inference_time = (time.time() - start_time) * 1000
                     logger.info(f"Frame processed in {inference_time:.1f}ms")
@@ -205,20 +265,15 @@ class VideoProcessor:
                     # Put result in queue
                     self.result_queue.put((frame.copy(), results[0] if results else None))
                     
-                    # Small sleep to prevent tight loop if CPU bound
-                    time.sleep(0.001)
-                    
                 except Exception as e:
                     logger.error(f"Inference error: {e}")
                     continue
 
-        except Exception as e:
-            logger.error(f"VideoProcessor error: {e}")
-            # Optionally signal error to UI
-        finally:
-            if self.cap:
-                self.cap.release()
-            logger.info("VideoProcessor stopped")
+            except Exception as e:
+                logger.error(f"VideoProcessor run loop error: {e}")
+                time.sleep(0.1)
+
+        logger.info("Inference processor stopped")
 
 class VehicleCounterApp:
     def __init__(self, root):
@@ -264,58 +319,136 @@ class VehicleCounterApp:
         self.frame_count_fps = 0
         self.last_fps_update = time.time()
         self.current_frame = None # Store for redrawing zone
+        self.video_position = 0 # Track current frame index for resume
         
         # Database Initialization
         self.init_db()
         
         # Initialize OCR in background
+        # Initialize OCR in background
         self.reader = None
+        self.ocr_queue = queue.Queue()
+        self.plate_cache = {} # Cache for Last Known Plate: {track_id: plate_text}
+        
+        # Start background threads
         threading.Thread(target=self.init_ocr, daemon=True).start()
+        threading.Thread(target=self.ocr_worker_loop, daemon=True).start()
         
         # UI
         self.create_widgets()
+        self.load_settings()
         self.update_status("Initializing... Loading Model...")
         
         # Start DB Polling for logs
         self.poll_db_logs()
         
         # Load Model Async
-        initial_model = 'models/custom_model.pt' if os.path.exists('models/custom_model.pt') else 'models/yolov8n.pt'
+        # Force usage of standard YOLOv8n model
+        initial_model = 'yolov8n.pt'
         threading.Thread(target=self.load_model, args=(initial_model,), daemon=True).start()
 
     def setup_styles(self):
         style = ttk.Style()
-        style.theme_use('vista') # Use a more native Windows look
+        style.theme_use('clam') # 'clam' allows more custom color configurations than 'vista'
         
-        # Colors - Light Theme
-        bg_light = "#f0f0f0"
-        fg_dark = "#000000"
-        accent = "#0056b3"
+        # Corporate Color Palette
+        self.colors = {
+            'bg_main': '#F4F6F9',       # Light Blue-Gray background
+            'bg_card': '#FFFFFF',       # White Card background
+            'primary': '#2C3E50',       # Dark Blue Header
+            'accent': '#3498DB',        # Bright Blue Buttons/Highlights
+            'text_main': '#2C3E50',     # Dark Text
+            'text_light': '#7F8C8D',    # Gray Text
+            'success': '#27AE60',       # Green
+            'danger': '#E74C3C',        # Red
+            'warning': '#F39C12'        # Orange
+        }
         
-        style.configure("TFrame", background=bg_light)
-        style.configure("TLabel", background=bg_light, foreground=fg_dark, font=("Segoe UI", 10))
-        style.configure("TButton", padding=5)
-        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground=accent)
+        # Configure Standard Elements
+        style.configure("TFrame", background=self.colors['bg_main'])
+        style.configure("Card.TFrame", background=self.colors['bg_card'], relief="flat")
         
-        # Notebook Style (Tabs)
-        style.configure("TNotebook", background=bg_light, borderwidth=1)
-        style.configure("TNotebook.Tab", padding=[15, 5], font=("Segoe UI", 10))
+        # Labels
+        style.configure("TLabel", background=self.colors['bg_main'], foreground=self.colors['text_main'], font=("Segoe UI", 10))
+        style.configure("Card.TLabel", background=self.colors['bg_card'], foreground=self.colors['text_main'], font=("Segoe UI", 10))
+        style.configure("Header.TLabel", background=self.colors['primary'], foreground="white", font=("Segoe UI", 14, "bold"), padding=10)
+        style.configure("SubHeader.TLabel", background=self.colors['bg_card'], foreground=self.colors['text_main'], font=("Segoe UI", 12, "bold"))
+        style.configure("BigStat.TLabel", background=self.colors['bg_card'], foreground=self.colors['accent'], font=("Segoe UI", 24, "bold"))
+        
+        # Buttons
+        style.configure("TButton", 
+                        font=("Segoe UI", 10, "bold"), 
+                        background=self.colors['accent'], 
+                        foreground="white", 
+                        borderwidth=0, 
+                        focuscolor="none", 
+                        padding=8)
+        style.map("TButton", 
+                  background=[('active', '#2980B9'), ('disabled', '#BDC3C7')],
+                  foreground=[('disabled', '#7F8C8D')])
+        
+        style.configure("Danger.TButton", background=self.colors['danger'])
+        style.map("Danger.TButton", background=[('active', '#C0392B')])
+
+        # Notebook (Tabs) - Modern Navigation Bar Style
+        style.configure("TNotebook", background=self.colors['bg_main'], borderwidth=0, tabmargins=[0, 10, 0, 0])
+        style.configure("TNotebook.Tab", 
+                        padding=[30, 12], 
+                        font=("Segoe UI", 11, "bold"),
+                        background="white",
+                        foreground=self.colors['text_light'],
+                        borderwidth=0,
+                        focuscolor=self.colors['bg_main']) # Remove focus ring
+                        
         style.map("TNotebook.Tab", 
-                  background=[("selected", "white"), ("!selected", "#e1e1e1")], 
-                  foreground=[("selected", accent), ("!selected", fg_dark)])
+                  background=[("selected", self.colors['primary']), ('active', '#ECF0F1')], 
+                  foreground=[("selected", "white"), ('active', self.colors['primary'])])
         
         # Treeview (Log Table)
-        style.configure("Treeview", background="white", foreground="black", fieldbackground="white", rowheight=25)
-        style.map("Treeview", background=[("selected", accent)], foreground=[("selected", "white")])
-        style.configure("Treeview.Heading", background="#e1e1e1", font=("Segoe UI", 10, "bold"))
+        style.configure("Treeview", 
+                        background="white", 
+                        foreground=self.colors['text_main'], 
+                        fieldbackground="white", 
+                        rowheight=30,
+                        font=("Segoe UI", 10))
+        style.configure("Treeview.Heading", 
+                        background=self.colors['primary'], 
+                        foreground="white", 
+                        font=("Segoe UI", 10, "bold"),
+                        relief="flat")
+        style.map("Treeview", background=[("selected", self.colors['accent'])], foreground=[("selected", "white")])
         
-        # Calendar/Entry
-        style.configure("Date.TEntry", padding=5)
+        # Labelframes
+        style.configure("TLabelframe", background=self.colors['bg_main'], borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background=self.colors['bg_main'], foreground=self.colors['text_main'], font=("Segoe UI", 10, "bold")) 
+        
+        # Card Labelframes (White background)
+        style.configure("Card.TLabelframe", background=self.colors['bg_card'], borderwidth=1, relief="solid")
+        style.configure("Card.TLabelframe.Label", background=self.colors['bg_card'], foreground=self.colors['text_main'], font=("Segoe UI", 10, "bold"))
         
     def init_ocr(self):
         try:
             logger.info("Initializing EasyOCR (Background)...")
-            self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+            
+            # Detect if running as EXE (frozen) or script
+            if getattr(sys, 'frozen', False):
+                # PyInstaller Bundled Path
+                base_path = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.abspath(__file__))
+            else:
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            
+            # Look for models in 'models/ocr' relative to the app
+            local_model_dir = os.path.join(base_path, 'models', 'ocr')
+            
+            if os.path.exists(local_model_dir):
+                logger.info(f"Using bundled OCR models from: {local_model_dir}")
+                self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available(), 
+                                           model_storage_directory=local_model_dir,
+                                           download_enabled=False)
+            else:
+                logger.info("Using default EasyOCR storage")
+                self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+                
             logger.info("EasyOCR Initialized")
         except Exception as e:
             logger.error(f"Failed to initialize EasyOCR: {e}")
@@ -325,18 +458,21 @@ class VehicleCounterApp:
         self.root.state('zoomed')
         
         # Main Theme background
-        self.root.configure(bg="#f0f0f0")
+        self.root.configure(bg=self.colors['bg_main'])
         
         # Header
-        header_frame = ttk.Frame(self.root)
-        header_frame.pack(fill=tk.X, padx=20, pady=10)
+        header_frame = ttk.Frame(self.root, style="Header.TLabel") # Uses primary color
+        header_frame.pack(fill=tk.X)
         
         logo_lbl = ttk.Label(header_frame, text="GATE SYSTEM - VEHICLE TRACKER", style="Header.TLabel")
-        logo_lbl.pack(side=tk.LEFT)
+        logo_lbl.pack(side=tk.LEFT, padx=20, pady=10)
+        
+        # Power Button (Exit)
+        ttk.Button(header_frame, text="EXIT APP", command=self.on_close, style="Danger.TButton").pack(side=tk.RIGHT, padx=20)
         
         # Tabbed Layout
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         
         # --- TAB 1: Live View ---
         self.live_tab = ttk.Frame(self.notebook)
@@ -345,51 +481,58 @@ class VehicleCounterApp:
         live_container = ttk.Frame(self.live_tab)
         live_container.pack(fill=tk.BOTH, expand=True)
         
-        # Left: Video
+        # Left: Video (70% Width)
         self.video_frame = ttk.Frame(live_container)
-        self.video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         
         self.canvas = tk.Canvas(self.video_frame, bg='black', highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Double-Button-1>", self.open_zone_dialog)
         
-        # Right: Quick Controls & Live Stats
-        live_right_panel = ttk.Frame(live_container, width=350)
+        # Right: Quick Controls & Live Stats (30%)
+        live_right_panel = ttk.Frame(live_container, width=400)
         live_right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=5)
         
-        # Controls Group
-        self.controls_frame = ttk.LabelFrame(live_right_panel, text="Camera & Source", padding=15)
+        # Controls Group (Card Style)
+        self.controls_frame = ttk.LabelFrame(live_right_panel, text="System Control", padding=15, style="Card.TLabelframe")
         self.controls_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Label(self.controls_frame, text="Video Source:").pack(anchor=tk.W)
-        source_box = ttk.Frame(self.controls_frame)
+        ttk.Label(self.controls_frame, text="Video Source:", style="Card.TLabel").pack(anchor=tk.W)
+        source_box = ttk.Frame(self.controls_frame, style="Card.TFrame")
         source_box.pack(fill=tk.X, pady=5)
         
         self.file_path = tk.StringVar()
-        ttk.Entry(source_box, textvariable=self.file_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.browse_btn = ttk.Button(source_box, text="...", width=3, command=self.browse_file)
-        self.browse_btn.pack(side=tk.RIGHT, padx=2)
+        ttk.Entry(source_box, textvariable=self.file_path).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.browse_btn = ttk.Button(source_box, text="...", width=4, command=self.browse_file)
+        self.browse_btn.pack(side=tk.RIGHT)
         
-        ttk.Label(self.controls_frame, text="RTSP URL:").pack(anchor=tk.W, pady=(10, 0))
         self.rtsp_url = tk.StringVar(value="rtsp://")
-        ttk.Entry(self.controls_frame, textvariable=self.rtsp_url).pack(fill=tk.X, pady=5)
         
-        btn_box = ttk.Frame(self.controls_frame)
-        btn_box.pack(fill=tk.X, pady=10)
+        btn_box = ttk.Frame(self.controls_frame, style="Card.TFrame")
+        btn_box.pack(fill=tk.X, pady=15)
         self.start_btn = ttk.Button(btn_box, text="START SYSTEM", command=self.start_file_processing, state=tk.DISABLED)
-        self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        ttk.Button(btn_box, text="STOP", command=self.stop_processing).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(btn_box, text="STOP", command=self.stop_processing, style="Danger.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Last Plate Detected Display
+        self.plate_frame = ttk.LabelFrame(live_right_panel, text="Last Detected Plate", padding=20, style="Card.TLabelframe")
+        self.plate_frame.pack(fill=tk.X, pady=15)
+        
+        self.last_plate_label = ttk.Label(self.plate_frame, text="NO PLATE", style="BigStat.TLabel", anchor="center")
+        self.last_plate_label.pack(fill=tk.X)
+        self.last_plate_type = ttk.Label(self.plate_frame, text="Waiting...", style="Card.TLabel", anchor="center", font=("Segoe UI", 10, "italic"))
+        self.last_plate_type.pack(fill=tk.X)
         
         # Live Stats Group
-        self.stats_frame = ttk.LabelFrame(live_right_panel, text="Real-Time Detection", padding=15)
-        self.stats_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        self.stats_frame = ttk.LabelFrame(live_right_panel, text="Vehicle Counts", padding=15, style="Card.TLabelframe")
+        self.stats_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
         self.count_labels = {}
         
         # Add scrollable canvas for stats if many classes
-        self.stats_canvas = tk.Canvas(self.stats_frame, height=300, bg="#f0f0f0", highlightthickness=0)
+        self.stats_canvas = tk.Canvas(self.stats_frame, bg=self.colors['bg_card'], highlightthickness=0)
         self.stats_scrollbar = ttk.Scrollbar(self.stats_frame, orient="vertical", command=self.stats_canvas.yview)
-        self.scrollable_stats_frame = ttk.Frame(self.stats_canvas)
+        self.scrollable_stats_frame = ttk.Frame(self.stats_canvas, style="Card.TFrame")
         
         self.stats_scroll_window = self.stats_canvas.create_window((0, 0), window=self.scrollable_stats_frame, anchor="nw")
         
@@ -466,6 +609,27 @@ class VehicleCounterApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
+        # --- TAB 3: SYSTEM SETTINGS ---
+        self.settings_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.settings_tab, text="  SYSTEM SETTINGS  ")
+        
+        settings_container = ttk.Frame(self.settings_tab)
+        settings_container.pack(fill=tk.BOTH, expand=True, padx=50, pady=30)
+        
+        # Stream Config
+        stream_frame = ttk.LabelFrame(settings_container, text="Stream Configuration", padding=20)
+        stream_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Label(stream_frame, text="Default RTSP URL:").pack(anchor=tk.W)
+        ttk.Entry(stream_frame, textvariable=self.rtsp_url, width=60).pack(fill=tk.X, pady=5)
+        ttk.Label(stream_frame, text="Example: rtsp://username:password@ip_address:port/stream", font=("Segoe UI", 8), foreground="gray").pack(anchor=tk.W)
+        
+        # Action Buttons
+        actions_frame = ttk.Frame(settings_container)
+        actions_frame.pack(fill=tk.X, pady=30)
+        
+        ttk.Button(actions_frame, text="SAVE & APPLY SETTINGS", command=self.save_all_settings).pack(side=tk.LEFT, padx=5)
+        
         # Status Bar at very bottom
         self.status_var = tk.StringVar(value="Ready")
         self.status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
@@ -536,26 +700,313 @@ class VehicleCounterApp:
             # Migration: Add plate_number if it doesn't exist
             try:
                 self.cursor.execute('ALTER TABLE vehicle_logs ADD COLUMN plate_number TEXT')
-                self.conn.commit()
             except sqlite3.OperationalError:
                 pass # Column already exists
             
-            logger.info("Database initialized with plate_number support")
+            # Create settings table
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
+            self.conn.commit()
+            
+            logger.info("Database initialized with settings support")
         except Exception as e:
             logger.error(f"Database error: {e}")
 
+    def load_settings(self):
+        """Load system settings from database"""
+        try:
+            self.cursor.execute("SELECT key, value FROM settings")
+            rows = self.cursor.fetchall()
+            settings = {row[0]: row[1] for row in rows}
+            
+            # Apply to UI
+            if 'rtsp_url' in settings:
+                self.rtsp_url.set(settings['rtsp_url'])
+            
+            logger.info(f"Settings loaded: {settings}")
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}")
+
+    def save_setting(self, key, value):
+        """Save a single setting to database"""
+        try:
+            self.cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+            self.conn.commit()
+            logger.info(f"Setting saved: {key}={value}")
+        except Exception as e:
+            logger.error(f"Failed to save setting {key}: {e}")
+
+    def is_valid_indian_plate(self, text):
+        """Helper to validate if text matches strong Indian plate format"""
+        import re
+        if not text: return False
+        return bool(re.match(r'^[A-Z]{2}\d{1,2}[A-Z]+\d{4}$', text))
+
+    def get_best_plate(self, track_id):
+        """Find the most frequent/stable plate for a track_id"""
+        if track_id not in self.plate_history or not self.plate_history[track_id]:
+            return None
+        
+        # Get most common plate from history
+        counts = Counter(self.plate_history[track_id])
+        best_plate, count = counts.most_common(1)[0]
+        return best_plate
+
+    def ocr_worker_loop(self):
+        """Background thread to process OCR tasks sequentially"""
+        while not self.stop_event.is_set():
+            try:
+                task = self.ocr_queue.get(timeout=1.0)
+                
+                if task['type'] == 'scan' or task['type'] == 'log':
+                    img = task['image']
+                    track_id = task['track_id']
+                    
+                    text, conf = self.run_single_ocr(img)
+                    
+                    if text:
+                        # LOGIC: Trust "Strong" (Regex-validated) matches over history of weak matches
+                        is_strong = (conf > 0.9)
+                        
+                        # Add to history for voting
+                        if not hasattr(self, 'plate_history'): self.plate_history = defaultdict(list)
+                        
+                        # If HIGH CONFIDENCE, it overrides previous low-confidence noise
+                        # Check if we already have a strong history
+                        current_history = self.plate_history[track_id]
+                        has_strong_in_history = any(self.is_valid_indian_plate(p) for p in current_history)
+                        
+                        if is_strong:
+                             # If this is the first strong match, CLEAR the old noise
+                             if not has_strong_in_history:
+                                 self.plate_history[track_id] = [text] # Reset to this good one
+                                 logger.info(f"Strong Plate Override for #{track_id}: {text}")
+                             else:
+                                 self.plate_history[track_id].append(text)
+                        else:
+                             # Low confidence: Only add if we DON'T have a locked-in strong plate yet
+                             if not has_strong_in_history:
+                                 self.plate_history[track_id].append(text)
+
+                        # Keep history limited to last 10 reads
+                        if len(self.plate_history[track_id]) > 10:
+                            self.plate_history[track_id].pop(0)
+
+                        # Get voted "Best" plate
+                        stable_plate = self.get_best_plate(track_id)
+                        
+                        # Update cache
+                        self.plate_cache[track_id] = stable_plate
+                        
+                        # Update Last Detected Plate UI
+                        if stable_plate:
+                             try:
+                                self.root.after(0, lambda p=stable_plate, t=task['vehicle_type']: self.update_last_plate_ui(p, t))
+                             except: pass
+                             
+                        # If simple logging task
+                        if task['type'] == 'log':
+                            self.log_to_db(task['vehicle_type'], track_id, task['direction'], task['conf'], stable_plate)
+                            
+                self.ocr_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"OCR Worker Error: {e}")
+
+    def run_single_ocr(self, img):
+        """Helper to run actual EasyOCR on a cropped image (Background Thread)"""
+        if self.reader is None or img is None or img.size == 0:
+            return None, None
+            
+        try:
+            # OPTIMIZATION: Crop to remove top 30% (Removes Roof/Header text like 'PYDAH')
+            h, w = img.shape[:2]
+            # Safety check for very small images
+            if h > 50:
+                # Skip top 10% (Reduced from 30% to avoid cutting high plates)
+                crop_y = int(h * 0.10) 
+                plate_roi = img[crop_y:h, :]
+            else:
+                plate_roi = img
+
+            # Preprocessing
+            gray = cv2.cvtColor(plate_roi, cv2.COLOR_BGR2GRAY)
+            
+            # 1. Noise Reduction
+            bfilter = cv2.bilateralFilter(gray, 11, 17, 17) 
+            
+            # 2. Contrast Enhancement
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(bfilter)
+            
+            # 3. Binarization (Black & White) - Critical for sharp text
+            # Use simple thresholding or adaptive
+            _, enhanced = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Run OCR with paragraph=True to handle multi-line plates (common in India)
+            # detail=1 gives boxes, but paragraph=True merges lines automatically
+            ocr_result = self.reader.readtext(enhanced, detail=1, paragraph=True)
+            
+            best_text = None
+            best_conf = 0.0
+            
+            for (bbox, text) in ocr_result:
+                 logger.info(f"DEBUG OCR RAW: {text}") # Debug print
+                 
+                 # Clean up: "AP 39 UH 7092" -> "AP39UH7092"
+                 clean_text = "".join(filter(str.isalnum, text)).upper()
+                 
+                 # FILTER: Remove common noise words instead of discarding the whole text
+                 ignored_words = ["PYDAH", "TATA", "ASHOK", "LEYLAND", "INDIA", "STOP", "HORN", "SOUND", "KEEP", "DISTANCE", "SPEED", "40KM", "KERALA", "STATE", "TOURIST", "LBLATA", "MARCOPOLO", "BHARATBENZ"]
+                 for ignored in ignored_words:
+                     clean_text = clean_text.replace(ignored, "")
+                 
+                 # CORRECTION: Fix common State Code errors (e.g., GP -> AP)
+                 # Map of Invalid -> Valid
+                 state_corrections = {
+                    "GP": "AP", "6P": "AP", "8P": "AP", "4P": "AP", "MP":"AP", "JP": "AP", # Misreads for AP
+                    "T5": "TS", "I5": "TS", # Misreads for TS
+                    "KA": "KA", "TN": "TN", "KL": "KL", "OD": "OD", "MH": "MH"
+                 }
+                 
+                 # Check first 2 chars
+                 if len(clean_text) >= 2:
+                     first_two = clean_text[:2]
+                     if first_two in state_corrections:
+                         clean_text = state_corrections[first_two] + clean_text[2:]
+
+                 # ADVANCED FORMAT CORRECTION: Handle AP 39 34 7092 -> AP 39 UW 7092
+                 # Standard format: 2 Letters + 2 Numbers + 1-2 Letters + 4 Numbers
+                 # If we have enough chars, try to enforce this
+                 import re
+                 # This regex looks for chunks attempting to match the format
+                 if len(clean_text) >= 8:
+                     # Check the "Series" part (Chars 5 and 6 approximately)
+                     # Example: AP39 | 34 | 7092 -> The '34' should be letters
+                     
+                     # Helper to swap digit->char
+                     def digit_to_char(c):
+                         mapping = {'0':'O', '1':'I', '2':'Z', '3':'W', '4':'A', '5':'S', '6':'G', '7':'T', '8':'B', '9':'P'}
+                         return mapping.get(c, c)
+                         
+                     # If format effectively looks like 4 blocks merged or just a long string
+                     # We assume first 4 are State+Dist (AP39)
+                     # Last 4 are Number (7092)
+                     # Middle part MUST be alpha
+                     
+                     prefix = clean_text[:4] # AP39
+                     suffix = clean_text[-4:] # 7092
+                     middle = clean_text[4:-4] # 34 or UW
+                     
+                     if len(middle) > 0 and len(middle) <= 3:
+                         new_middle = ""
+                         for char in middle:
+                             if char.isdigit():
+                                 new_middle += digit_to_char(char)
+                             else:
+                                 new_middle += char
+                         clean_text = prefix + new_middle + suffix
+                         logger.info(f"Corrected Plate Format (Middle): {clean_text}")
+
+                     # NEW: Enforce Last 4 to be Digits (Suffix)
+                     suffix = clean_text[-4:]
+                     if len(clean_text) >= 8 and not suffix.isdigit():
+                         # Helper to swap char->digit
+                         def char_to_digit(c):
+                             mapping = {'O':'0', 'D':'0', 'I':'1', 'Z':'2', 'S':'5', 'G':'6', 'T':'7', 'B':'8', 'P':'9', 'A':'4'}
+                             return mapping.get(c, c)
+                        
+                         new_suffix = ""
+                         for char in suffix:
+                             if not char.isdigit():
+                                  new_suffix += char_to_digit(char)
+                             else:
+                                  new_suffix += char
+                         
+                         clean_text = clean_text[:-4] + new_suffix
+                         logger.info(f"Corrected Plate Format (Suffix): {clean_text}")
+
+                     if len(clean_text) >= 5:
+                         
+                         # STRICT REGEX VALIDATION for Indian Plates
+                         # Format: 2 Letters (State) + 1-2 Digits (Dist) + 1-3 Letters (Series) + 4 Digits (Num)
+                         # Example: AP 39 UW 7092
+                         if re.match(r'^[A-Z]{2}\d{1,2}[A-Z]+\d{4}$', clean_text):
+                             # Excellent match
+                             best_text = clean_text
+                             best_conf = 0.95
+                             logger.info(f"Strong Plate Match: {best_text}")
+                             break
+                         
+                         # Fallback: Check digit count and structure looser
+                         digit_count = sum(c.isdigit() for c in clean_text)
+                         alpha_count = sum(c.isalpha() for c in clean_text)
+                         
+                         # Heuristic: Valid plate usually has balanced mix. Garbage mostly letters.
+                         # RAISED THRESHOLD: Require at least 3 digits and 3 letters to accept a non-regex result
+                         if digit_count >= 3 and alpha_count >= 3:
+                             best_text = clean_text
+                             best_conf = 0.6
+                             # Keep searching for a better regex match, but store this just in case
+                         
+                         # If it looks like garbage "LBLATA..." (mostly letters, few digits at end?), skip
+                         # Strict skipping for noise
+                         if alpha_count > digit_count * 2: 
+                             continue 
+            
+            return best_text, best_conf
+            
+        except Exception as e:
+            logger.error(f"OCR Error: {e}")
+            return None, None
+
     def log_to_db(self, vehicle_type, track_id, direction, confidence, plate_number=None):
-        """Save a detection event to the database"""
+        """Save OR UPDATE a detection event to the database"""
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.cursor.execute('''
-                INSERT INTO vehicle_logs (timestamp, vehicle_type, track_id, direction, confidence, plate_number)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (timestamp, vehicle_type, track_id, direction, confidence, plate_number))
-            self.conn.commit()
-            logger.info(f"DB Log: {vehicle_type} #{track_id} {direction} {f'[{plate_number}]' if plate_number else ''}")
+            
+            # Check if we already logged this track_id recently (to avoid duplicates or improve existing log)
+            # We look for a log with same track_id today
+            self.cursor.execute("SELECT id, plate_number FROM vehicle_logs WHERE track_id=? AND timestamp LIKE ? ORDER BY id DESC LIMIT 1", 
+                              (track_id, f"{timestamp[:10]}%"))
+            existing = self.cursor.fetchone()
+            
+            if existing:
+                row_id, existing_plate = existing
+                # If we have a new plate and the old one was None or different, UPDATE it
+                # We prioritize the "Latest" reading as it might be closer/better
+                if plate_number and plate_number != existing_plate:
+                     self.cursor.execute("UPDATE vehicle_logs SET plate_number=?, confidence=? WHERE id=?", 
+                                       (plate_number, confidence, row_id))
+                     self.conn.commit()
+                     logger.info(f"DB Update: #{track_id} plate updated to {plate_number}")
+                else:
+                    # Duplicate or no improvement, ignore
+                    pass
+            else:
+                # INSERT NEW
+                self.cursor.execute('''
+                    INSERT INTO vehicle_logs (timestamp, vehicle_type, track_id, direction, confidence, plate_number)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (timestamp, vehicle_type, track_id, direction, confidence, plate_number))
+                self.conn.commit()
+                logger.info(f"DB Log: {vehicle_type} #{track_id} {direction} {f'[{plate_number}]' if plate_number else ''}")
+                
         except Exception as e:
             logger.error(f"Failed to log to DB: {e}")
+
+    def update_last_plate_ui(self, plate_text, vehicle_type):
+        """Update the UI labels for the last detected plate"""
+        try:
+            self.last_plate_label.config(text=plate_text, foreground=self.colors['accent'])
+            self.last_plate_type.config(text=f"Detected Vehicle: {vehicle_type}", foreground=self.colors['success'])
+        except Exception as e:
+            pass
 
     def setup_stats_ui(self):
         # Clear existing
@@ -563,26 +1014,26 @@ class VehicleCounterApp:
             widget.destroy()
         self.count_labels.clear()
         
-        # Get classes from model
-        if self.model and hasattr(self.model, 'names'):
-            class_names = self.model.names
-            # Handle if names is dict or list
-            if isinstance(class_names, dict):
-                 self.active_classes = class_names
-            else:
-                 self.active_classes = {i: name for i, name in enumerate(class_names)}
-                 
-            for cls_id, cls_name in self.active_classes.items():
-                row = ttk.Frame(self.scrollable_stats_frame)
-                row.pack(fill=tk.X, pady=2, padx=5)
+        # Define relevant vehicle classes (COCO indices)
+        # 2: car, 3: motorcycle, 5: bus, 7: truck
+        relevant_classes = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
                 
-                # Icon/Name
-                ttk.Label(row, text=f"{cls_name}:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+        self.active_classes = relevant_classes
+        
+        # Sort by name for display
+        sorted_items = sorted(self.active_classes.items(), key=lambda x: x[1])
                 
-                # Count Value
-                lbl = ttk.Label(row, text="0 (In:0 Out:0)", font=("Arial", 10), foreground="#007acc")
-                lbl.pack(side=tk.RIGHT)
-                self.count_labels[cls_name] = lbl
+        for cls_id, cls_name in sorted_items:
+            row = ttk.Frame(self.scrollable_stats_frame)
+            row.pack(fill=tk.X, pady=2, padx=5)
+            
+            # Icon/Name
+            ttk.Label(row, text=f"{cls_name}:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+            
+            # Count Value
+            lbl = ttk.Label(row, text="0 (In:0 Out:0)", font=("Arial", 10), foreground="#007acc")
+            lbl.pack(side=tk.RIGHT)
+            self.count_labels[cls_name] = lbl
             
             # Reset counters
             self.counted_ids.clear()
@@ -596,6 +1047,11 @@ class VehicleCounterApp:
             self.progress.start(10)
             threading.Thread(target=self.load_model, args=(path,), daemon=True).start()
 
+
+    def save_all_settings(self):
+        """Save all current settings to database"""
+        self.save_setting('rtsp_url', self.rtsp_url.get())
+        messagebox.showinfo("Success", "Settings saved and applied!")
 
     def enable_ui(self):
         self.start_btn.config(state=tk.NORMAL)
@@ -637,19 +1093,32 @@ class VehicleCounterApp:
             self.update_status("Failed to load video preview.")
 
     def start_file_processing(self):
+        # 1. Check for local file
         path = self.file_path.get()
-        if not path: return
-        self.start_processing(path)
-
-    def start_rtsp(self):
+        if path:
+            self.start_processing(path)
+            return
+            
+        # 2. Check for RTSP URL
         url = self.rtsp_url.get()
-        if len(url) < 8: return
-        self.start_processing(url)
+        if url and url != "rtsp://":
+            self.start_processing(url)
+            return
+            
+        messagebox.showwarning("Warning", "Please select a video file or configure an RTSP URL in Settings.")
 
     def start_processing(self, source):
+        # If switching sources, reset video position
+        if source != self.current_source:
+             self.video_position = 0
+        
         self.current_source = source
+        
+        # NOTE: Do NOT reset is_running here, wait until cleared
         if self.is_running:
             self.stop_processing()
+            # Small delay to let thread die
+            time.sleep(0.5)
             
         self.stop_event.clear()
         
@@ -664,6 +1133,12 @@ class VehicleCounterApp:
         self.track_data.clear()
         self.prev_positions = {}
         
+        # CLEAR CACHES to prevent stale data on restart
+        if hasattr(self, 'plate_cache'): self.plate_cache.clear()
+        if hasattr(self, 'plate_history'): self.plate_history.clear()
+        if hasattr(self, 'last_plate_label'): self.last_plate_label.config(text="NO PLATE")
+        if hasattr(self, 'last_plate_type'): self.last_plate_type.config(text="Waiting...")
+        
         # Calculate Zone Center Line (in frame coords) for crossing check
         self.zone_center_y = None
         if self.zone_defined and len(self.zone_points) == 2 and hasattr(self, 'scale') and self.scale > 0:
@@ -677,7 +1152,7 @@ class VehicleCounterApp:
             
         # Start Thread
         self.processor_thread = threading.Thread(
-            target=VideoProcessor(self.model, source, self.result_queue, self.stop_event, self.device).run,
+            target=VideoProcessor(self.model, source, self.result_queue, self.stop_event, self.device, start_frame=self.video_position).run,
             daemon=True
         )
         self.processor_thread.start()
@@ -711,6 +1186,15 @@ class VehicleCounterApp:
         except:
             pass
 
+    def get_available_dates(self):
+        """Fetch unique dates that have vehicle logs from the database"""
+        try:
+            self.cursor.execute("SELECT DISTINCT substr(timestamp, 1, 10) FROM vehicle_logs ORDER BY timestamp DESC")
+            return [r[0] for r in self.cursor.fetchall() if r[0]]
+        except Exception as e:
+            logger.error(f"Error fetching available dates: {e}")
+            return []
+
     def show_calendar(self):
         """Show a visual calendar picker popup"""
         top = tk.Toplevel(self.root)
@@ -733,6 +1217,8 @@ class VehicleCounterApp:
             
         month_var = tk.IntVar(value=current_date.month)
         year_var = tk.IntVar(value=current_date.year)
+        
+        available_dates = self.get_available_dates()
         
         def refresh_calendar():
             # Clear previous grid
@@ -757,17 +1243,25 @@ class VehicleCounterApp:
             for row_idx, week in enumerate(month_cal):
                 for col_idx, day in enumerate(week):
                     if day != 0:
-                        btn = tk.Button(calendar_frame, text=str(day), width=4, 
-                                        relief="flat", bg="white", activebackground="#0056b3",
-                                        activeforeground="white")
-                        btn.grid(row=row_idx+1, column=col_idx, padx=2, pady=2)
-                        
-                        # Selection logic
                         date_str = f"{y}-{m:02d}-{day:02d}"
-                        if date_str == self.filter_date_var.get():
-                             btn.config(bg="#e1e1e1", fg="#0056b3", font=("Segoe UI", 9, "bold"))
+                        is_available = date_str in available_dates
                         
-                        btn.config(command=lambda d=date_str: select_date(d))
+                        btn = tk.Button(calendar_frame, text=str(day), width=4, 
+                                        relief="flat", activebackground="#0056b3",
+                                        activeforeground="white")
+                        
+                        # Style based on availability
+                        if is_available:
+                            btn.config(bg="white", fg="black", font=("Segoe UI", 9, "bold"))
+                            btn.config(command=lambda d=date_str: select_date(d))
+                        else:
+                            btn.config(bg="#f0f0f0", fg="#cccccc", state=tk.DISABLED)
+                        
+                        # Highlight current selection
+                        if date_str == self.filter_date_var.get():
+                             btn.config(bg="#0056b3", fg="white")
+                        
+                        btn.grid(row=row_idx+1, column=col_idx, padx=2, pady=2)
 
         def select_date(d):
             self.filter_date_var.set(d)
@@ -874,184 +1368,230 @@ class VehicleCounterApp:
                 self.root.after(10, self.poll_results)
 
     def get_plate_number(self, frame, box):
-        """Extract and OCR license plate from a vehicle box"""
+        """Extract and OCR license plate from a vehicle box. Returns (text, relative_bbox)"""
         if self.reader is None:
-             return "No OCR"
+             return "No OCR", None
              
         try:
+            h_frame, w_frame = frame.shape[:2]
             # Get coordinates
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            vx1, vy1, vx2, vy2 = map(int, box.xyxy[0])
             
-            # Crop vehicle
-            vehicle_img = frame[y1:y2, x1:x2]
+            # Crop vehicle with small padding
+            pad = 10
+            cx1, cy1 = max(0, vx1-pad), max(0, vy1-pad)
+            cx2, cy2 = min(w_frame, vx2+pad), min(h_frame, vy2+pad)
+            vehicle_img = frame[cy1:cy2, cx1:cx2]
             
-            # Simple heuristic: License plates are usually in the lower 60% of the vehicle
-            h, w = vehicle_img.shape[:2]
-            crop_top = int(h * 0.4)
-            plate_area = vehicle_img[crop_top:h, :]
+            if vehicle_img.size == 0: return "Unknown", None
+
+            # Image Enhancement for OCR
+            gray = cv2.cvtColor(vehicle_img, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(gray)
             
-            # Run OCR
-            # detail=0 means just return text
-            result = self.reader.readtext(plate_area, detail=0, paragraph=True)
+            # Run OCR with detail=1 to get bboxes
+            results = self.reader.readtext(enhanced, detail=1, paragraph=False)
             
-            if result:
-                # Clean up text (remove spaces, special chars)
-                text = "".join(result).replace(" ", "").upper()
-                # Basic plate validation (length check etc can be added)
-                return text[:15] # Limit length
-            return "Unknown"
+            best_text = "Unknown"
+            best_bbox = None
+            max_digits = 0
+            
+            import re
+            digit_pattern = re.compile(r'\d')
+
+            for (bbox, text, prob) in results:
+                if prob < 0.2: continue
+                # Clean text
+                clean = "".join(filter(str.isalnum, text)).upper()
+                if len(clean) < 4: continue
+                
+                # Heuristic: Plate usually has many digits
+                digit_count = len(digit_pattern.findall(clean))
+                if digit_count >= max_digits:
+                    max_digits = digit_count
+                    best_text = clean
+                    # Convert relative OCR bbox to absolute frame coordinates
+                    # bbox is list of 4 points [(x,y), (x,y), (x,y), (x,y)] relative to vehicle_img
+                    abs_bbox = []
+                    for pt in bbox:
+                        abs_bbox.append((int(pt[0] + cx1), int(pt[1] + cy1)))
+                    best_bbox = abs_bbox
+
+            return best_text, best_bbox
         except Exception as e:
             logger.error(f"OCR Error: {e}")
-            return "Error"
+            return "Error", None
 
     def update_stats(self, results, frame):
+        # 0. DEEP COPY CLEAN FRAME for OCR (Before any UI overlays are drawn)
+        clean_frame = frame.copy()
+        
         current_counts = defaultdict(int)
+        h_frame, w_frame = frame.shape[:2]
         
-        # Canvas Dimensions
-        canvas_w = self.canvas.winfo_width()
-        canvas_h = self.canvas.winfo_height()
-        
+        # 1. DRAW CROSSING LINE (Visual Only)
+        # ... (rest of the visual drawing logic stays on 'frame', not 'clean_frame')
+        if self.zone_defined and len(self.zone_points) == 2:
+            z_x1_c, z_y1_c = self.zone_points[0]
+            z_x2_c, z_y2_c = self.zone_points[1]
+            if hasattr(self, 'scale') and self.scale > 0:
+                z_x1 = (z_x1_c - self.offset_x) / self.scale
+                z_y1 = (z_y1_c - self.offset_y) / self.scale
+                z_x2 = (z_x2_c - self.offset_x) / self.scale
+                z_y2 = (z_y2_c - self.offset_y) / self.scale
+                zone_center_y = (z_y1 + z_y2) / 2
+                line_x1, line_x2 = int(z_x1), int(z_x2)
+            else:
+                zone_center_y = int(h_frame * 0.65) # Lower default line for better tracking
+                line_x1, line_x2 = 0, w_frame
+        else:
+            zone_center_y = int(h_frame * 0.65)
+            line_x1, line_x2 = 0, w_frame
+
+        cv2.line(frame, (line_x1, int(zone_center_y)), (line_x2, int(zone_center_y)), (0, 255, 255), 2)
+        cv2.putText(frame, "COUNTING LINE", (10, int(zone_center_y) - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        # 1.5. GLOBAL PLATE SCAN (Fallback) - Use CLEAN_FRAME
+        found_any_vehicle = results and len(results.boxes) > 0
+        should_scan_global = (not found_any_vehicle and getattr(self, 'frame_idx', 0) % 5 == 0) or (getattr(self, 'frame_idx', 0) % 20 == 0)
+        self.frame_idx = getattr(self, 'frame_idx', 0) + 1
+
+        if should_scan_global:
+            strip_h = 300 # Larger strip for better coverage
+            y_start = max(0, int(zone_center_y - strip_h // 2))
+            # GLOBAL SCAN DISABLED: It causes duplicate '999' logs and overrides tracked vehicle logic.
+            # Only rely on Tracked Vehicle OCR for consistency.
+            pass
+
         if results:
             for box in results.boxes:
                 # Class Mapping
                 cls_id = int(box.cls[0].item())
-                # Use dynamic labels from model
-                if self.model and hasattr(self.model, 'names'):
-                     label = self.model.names[cls_id]
-                else:
-                     label = str(cls_id) 
-                
+                label = self.model.names[cls_id] if self.model and hasattr(self.model, 'names') else str(cls_id)
                 if not label: continue
                 
+                # FILTER: Only process labels that are in our custom stats UI
+                if label not in self.count_labels:
+                    continue
+
                 # Coords
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 cx, cy = (x1 + x2)/2, (y1 + y2)/2
                 
-                # Check if currently in zone
-                in_zone = self.is_in_zone(cx, cy)
+                track_id = int(box.id[0].item()) if box.id is not None else None
+                in_zone = self.is_in_zone(cx, cy) if self.zone_defined else True
                 
-                # Draw the Crossing Line (Visual Only)
-                if len(self.zone_points) == 2:
-                    z_x1_c, z_y1_c = self.zone_points[0]
-                    z_x2_c, z_y2_c = self.zone_points[1]
-                    line_y_canvas = (z_y1_c + z_y2_c) // 2
-                    cv2.line(frame, (int(z_x1_c), int(line_y_canvas)), (int(z_x2_c), int(line_y_canvas)), (255, 255, 0), 2)
-                    cv2.putText(frame, "CROSSING LINE", (int(z_x1_c), int(line_y_canvas)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-
-                
-                # SPECIAL CASE: Single Image Processing
-                # Check if currently processing an image
-                is_image = False
-                if hasattr(self, 'current_source') and self.current_source:
-                    is_image = str(self.current_source).lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
-                
-                if is_image and in_zone:
-                    # For images, YOLO might not give a track_id. Use 999 as placeholder.
-                    track_id = int(box.id[0].item()) if box.id is not None else 999
-                    if label not in self.counted_ids:
-                         self.counted_ids[label] = {'in': set(), 'out': set(), 'stationary': set()}
-                    
-                    if track_id not in self.counted_ids[label]['stationary']:
-                         self.counted_ids[label]['stationary'].add(track_id)
-                         plate_number = self.get_plate_number(frame, box)
-                         self.log_to_db(label, track_id, "STATIONARY", float(box.conf[0].item()), plate_number)
-                         logger.info(f"Image Detection: {label} Plate: {plate_number}")
-
-                
-                # Prepare label
-                text = f"{label}"
-                if box.id is not None:
-                    track_id = int(box.id[0].item())
-                    text += f" #{track_id}"
-                
-                # Draw Box
                 color = (0, 255, 0) if in_zone else (0, 0, 255)
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                cv2.putText(frame, text, (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 
-                # Counting Logic: Line Crossing with Dynamic Scale Handling
-                if box.id is not None and len(self.zone_points) == 2:
-                    track_id = int(box.id[0].item())
-                    
-                    # Ensure we have valid scale/offset
-                    if hasattr(self, 'scale') and self.scale > 0:
-                         # Dynamic Zone Calculation (Frame Coords)
-                         z_x1_c, z_y1_c = self.zone_points[0]
-                         z_x2_c, z_y2_c = self.zone_points[1]
-                         
-                         # Convert Canvas -> Frame
-                         z_y1 = (z_y1_c - self.offset_y) / self.scale
-                         z_y2 = (z_y2_c - self.offset_y) / self.scale
-                         z_x1 = (z_x1_c - self.offset_x) / self.scale
-                         z_x2 = (z_x2_c - self.offset_x) / self.scale
-                         
-                         zone_center_y = (z_y1 + z_y2) / 2
-                         
-                         # Draw the Scan Line for visual feedback
-                         line_y_canvas = (z_y1_c + z_y2_c) // 2
-                         cv2.line(frame, (int(z_x1_c), int(line_y_canvas)), (int(z_x2_c), int(line_y_canvas)), (0, 0, 255), 2)
-                         
-                         min_x = min(z_x1, z_x2)
-                         max_x = max(z_x1, z_x2)
-                    
-                         # Update Track Data
-                         # Only consider points roughly within X-bounds (prevent cross-lane counting)
-                         if min_x <= cx <= max_x:
-                             # Initialize for new labels if not already done
-                             if label not in self.counted_ids:
-                                 self.counted_ids[label] = {'in': set(), 'out': set()}
+                label_text = f"{label}"
+                if track_id is not None:
+                    label_text += f" #{track_id}"
+                cv2.putText(frame, label_text, (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                             t_data = self.track_data[track_id]
-                             t_data['min_y'] = min(t_data['min_y'], cy)
-                             t_data['max_y'] = max(t_data['max_y'], cy)
-                             if t_data['start_y'] is None:
-                                 t_data['start_y'] = cy
-                             
-                             # Check Crossing: Has track spanned across the center line?
-                             # AND check direction
-                             crossed = (t_data['min_y'] < zone_center_y) and (t_data['max_y'] > zone_center_y)
-                             
-                             if crossed:
-                                 # Determine Direction based on net movement
-                                 # Current y vs Start y
-                                 delta = cy - t_data['start_y']
-                                 
-                                 # IN: Moving Down (positive delta)
-                                 if delta > 0:
-                                     if track_id not in self.counted_ids[label]['in']:
-                                        self.counted_ids[label]['in'].add(track_id)
-                                        # Call OCR
-                                        plate_number = self.get_plate_number(frame, box)
-                                        # Log to Database
-                                        self.log_to_db(label, track_id, "IN", float(box.conf[0].item()), plate_number)
-                                        logger.info(f"Counted IN: {label} #{track_id} Plate: {plate_number}")
-                                 
-                                 # OUT: Moving Up (negative delta)
-                                 # Use a threshold to avoid jitter
-                                 elif delta < 0:
-                                     if track_id not in self.counted_ids[label]['out']:
-                                        self.counted_ids[label]['out'].add(track_id)
-                                        # Call OCR
-                                        plate_number = self.get_plate_number(frame, box)
-                                        # Log to Database
-                                        self.log_to_db(label, track_id, "OUT", float(box.conf[0].item()), plate_number)
-                                        logger.info(f"Counted OUT: {label} #{track_id} Plate: {plate_number}")
+                # 3. Counting Logic: Line Crossing with Direction
+                if track_id is not None:
+                    t_data = self.track_data[track_id]
+                    t_data['min_y'] = min(t_data['min_y'], cy)
+                    t_data['max_y'] = max(t_data['max_y'], cy)
+                    if t_data['start_y'] is None:
+                        t_data['start_y'] = cy
+                    
+                    # Robust Crossing Logic: Check if center point crossed the line
+                    # We use the previous position (if available) to detect the exact frame of crossing
+                    prev_cx, prev_cy = self.prev_positions.get(track_id, (None, None))
+                    
+                    if prev_cy is not None:
+                        # Crossing Down (IN)
+                        if prev_cy < zone_center_y and cy >= zone_center_y:
+                            if label not in self.counted_ids: self.counted_ids[label] = { 'in': set(), 'out': set() }
+                            
+                            if track_id not in self.counted_ids[label]['in']:
+                                self.counted_ids[label]['in'].add(track_id)
+                                
+                                # Queue Log Event
+                                pad = 10
+                                vx1, vy1, vx2, vy2 = int(x1), int(y1), int(x2), int(y2)
+                                cx1, cy1 = max(0, vx1-pad), max(0, vy1-pad)
+                                cx2, cy2 = min(w_frame, vx2+pad), min(h_frame, vy2+pad)
+                                vehicle_crop = clean_frame[cy1:cy2, cx1:cx2].copy()
+                                
+                                self.ocr_queue.put({
+                                    'type': 'log',
+                                    'image': vehicle_crop,
+                                    'vehicle_type': label,
+                                    'track_id': track_id,
+                                    'direction': 'IN',
+                                    'conf': float(box.conf[0].item())
+                                })
+                                logger.info(f"Counted IN: {label} #{track_id}")
 
-                    # Update position
+                        # Crossing Up (OUT)
+                        elif prev_cy > zone_center_y and cy <= zone_center_y:
+                             if label not in self.counted_ids: self.counted_ids[label] = { 'in': set(), 'out': set() }
+                             
+                             if track_id not in self.counted_ids[label]['out']:
+                                self.counted_ids[label]['out'].add(track_id)
+                                
+                                # Queue Log Event
+                                pad = 10
+                                vx1, vy1, vx2, vy2 = int(x1), int(y1), int(x2), int(y2)
+                                cx1, cy1 = max(0, vx1-pad), max(0, vy1-pad)
+                                cx2, cy2 = min(w_frame, vx2+pad), min(h_frame, vy2+pad)
+                                vehicle_crop = clean_frame[cy1:cy2, cx1:cx2].copy()
+                                
+                                self.ocr_queue.put({
+                                    'type': 'log',
+                                    'image': vehicle_crop,
+                                    'vehicle_type': label,
+                                    'track_id': track_id,
+                                    'direction': 'OUT',
+                                    'conf': float(box.conf[0].item())
+                                })
+                                logger.info(f"Counted OUT: {label} #{track_id}")
+
+                    # 4. DRAW PLATE BOX (Visual Only - Non Blocking)
+                    # Check cache
+                    cached_plate = self.plate_cache.get(track_id)
+                    
+                    if cached_plate:
+                        cv2.putText(frame, f"PLATE: {cached_plate}", (int(x1), int(y2)+20), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        
+                        # Force UI update if this is the active track (Safety Net)
+                        # We use a simple throttle to avoid saturating the UI thread
+                        if self.frame_count_fps % 10 == 0:
+                             try:
+                                self.root.after(0, lambda p=cached_plate, t=label: self.update_last_plate_ui(p, t))
+                             except: pass
+                    else:
+                        # Periodically trigger a scan for display only (Every 30 frames approx)
+                        if self.frame_count_fps % 30 == 0:
+                             pad = 10
+                             vx1, vy1, vx2, vy2 = int(x1), int(y1), int(x2), int(y2)
+                             cx1, cy1 = max(0, vx1-pad), max(0, vy1-pad)
+                             cx2, cy2 = min(w_frame, vx2+pad), min(h_frame, vy2+pad)
+                             vehicle_crop = clean_frame[cy1:cy2, cx1:cx2].copy()
+                             
+                             # Only queue if queue isn't backed up
+                             if self.ocr_queue.qsize() < 3:
+                                 self.ocr_queue.put({
+                                    'type': 'scan',
+                                    'image': vehicle_crop,
+                                    'track_id': track_id
+                                 })
+
                     self.prev_positions[track_id] = (cx, cy)
 
         # Update UI Labels
-        text_parts = []
         for k in sorted(self.count_labels.keys()):
             in_count = len(self.counted_ids[k]['in'])
             out_count = len(self.counted_ids[k]['out'])
-            
-            # Update label text
-            # Format: "Car: 5 (In:3 Out:2)"
             lbl = self.count_labels[k]
             lbl.config(text=f"{in_count + out_count} (In:{in_count} Out:{out_count})")
 
-            
         # FPS Calculation
         self.frame_count_fps += 1
         curr_time = time.time()
@@ -1062,10 +1602,15 @@ class VehicleCounterApp:
             self.last_fps_update = curr_time
             
         self.display_frame(frame)
+        
+        # Track position (simple increment) - this assumes 1 frame processed = 1 frame advanced
+        # Ideally VideoProcessor would send this, but this is a good approximation for resume
+        self.video_position += 1
 
 
 
     def display_frame(self, frame, is_video=True):
+        self.current_frame = frame # Store latest frame for zone configuration
         # Resize to fit canvas
         canvas_w = max(self.canvas.winfo_width(), 640)
         canvas_h = max(self.canvas.winfo_height(), 480)

@@ -8,6 +8,9 @@ import threading
 import torch
 import easyocr
 import logging
+import time
+import queue
+import urllib.parse
 from ultralytics import YOLO
 
 # Set up logging
@@ -33,6 +36,187 @@ IGNORE_WORDS = [
     "HYUNDAI", "TEAM-BHP.COM", "WWW", "SHOP", "FORC", "FORO", "PLNET", "PLANT", "MOTORS", "CARS"
 ]
 
+def sanitize_rtsp_url(url):
+    """
+    Sanitize RTSP URL by encoding special characters in the password.
+    """
+    if not isinstance(url, str) or not url.startswith('rtsp://'):
+        return url
+    
+    try:
+        prefix = 'rtsp://'
+        url_stripped = url[len(prefix):]
+        
+        if '@' not in url_stripped:
+            return url
+            
+        parts = url_stripped.rsplit('@', 1)
+        if len(parts) != 2:
+            return url
+            
+        creds, host_part = parts
+        
+        if ':' in creds:
+            user, password = creds.split(':', 1)
+            if '%' not in password:
+                encoded_password = urllib.parse.quote(password)
+                sanitized = f"{prefix}{user}:{encoded_password}@{host_part}"
+                logger.info(f"RTSP URL sanitized (password encoded)")
+                return sanitized
+        
+        return url
+    except Exception as e:
+        logger.error(f"Error sanitizing RTSP URL: {e}")
+        return url
+
+class ANPRVideoProcessor:
+    """
+    Handles video capture from RTSP/Video and performs ANPR.
+    Uses a separate reader thread to ensure RTSP stability and zero lag.
+    """
+    def __init__(self, model, app_instance, source, result_queue, stop_event, device='cpu'):
+        self.model = model
+        self.app = app_instance
+        self.source = source
+        self.result_queue = result_queue
+        self.stop_event = stop_event
+        self.device = device
+        self.cap = None
+        self.frame_buffer = queue.Queue(maxsize=1) # Only keep the freshest frame
+
+    def _reader(self):
+        """Dedicated thread for reading frames as fast as possible."""
+        proc_source = sanitize_rtsp_url(self.source)
+        
+        # Set RTSP transport and timeout options
+        if isinstance(self.source, str) and self.source.startswith('rtsp://'):
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+            logger.info("RTSP Optimization: Forcing TCP transport")
+
+        self.cap = cv2.VideoCapture(proc_source, cv2.CAP_FFMPEG)
+        if not self.cap.isOpened():
+            logger.error(f"Could not open video source: {proc_source}")
+            return
+
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        retry_count = 0
+        max_retries = 30
+
+        while not self.stop_event.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                retry_count += 1
+                if retry_count < max_retries:
+                    if retry_count % 5 == 0:
+                        logger.warning(f"RTSP Glitch: Retrying frame read ({retry_count}/{max_retries})...")
+                        if retry_count >= 15:
+                            logger.info("Attempting to re-open stream...")
+                            self.cap.release()
+                            time.sleep(1.0)
+                            self.cap = cv2.VideoCapture(proc_source, cv2.CAP_FFMPEG)
+                    time.sleep(0.05)
+                    continue
+                else:
+                    break
+            
+            retry_count = 0
+            # Push the freshest frame to the buffer
+            if not self.frame_buffer.full():
+                self.frame_buffer.put(frame)
+            else:
+                try:
+                    self.frame_buffer.get_nowait()
+                    self.frame_buffer.put(frame)
+                except:
+                    pass
+        
+        if self.cap:
+            self.cap.release()
+        logger.info("Reader thread stopped")
+
+    def run(self):
+        # Start the reader thread
+        reader_thread = threading.Thread(target=self._reader, daemon=True)
+        reader_thread.start()
+        
+        frame_idx = 0
+        
+        while not self.stop_event.is_set():
+            try:
+                # Wait for the next available frame (blocking with timeout)
+                try:
+                    frame = self.frame_buffer.get(timeout=1.0)
+                except queue.Empty:
+                    if not reader_thread.is_alive(): break
+                    continue
+
+                if self.result_queue.full():
+                    try: self.result_queue.get_nowait()
+                    except: pass
+
+                try:
+                    img_copy = frame.copy()
+                    
+                    # 1. YOLO Detection
+                    results = self.model(img_copy, device=self.device, verbose=False)[0]
+                    candidates = []
+                    
+                    for box in results.boxes:
+                        conf = float(box.conf[0].item())
+                        if conf < 0.25: continue
+                        label = self.model.names[int(box.cls[0].item())]
+                        vx1, vy1, vx2, vy2 = map(int, box.xyxy[0])
+                        cv2.rectangle(img_copy, (vx1, vy1), (vx2, vy2), (0, 255, 0), 2)
+                        
+                        plates = self.app.get_plate(frame, box)
+                        for p_text, p_state, p_prob, p_bbox in plates:
+                            candidates.append({'label': label, 'text': p_text, 'state': p_state, 
+                                              'conf': f"{conf*100:.1f}%", 'bbox': p_bbox, 'prob': p_prob})
+
+                    # 2. Global Scan (Run every 15 frames for better performance)
+                    if frame_idx % 15 == 0:
+                        global_plates = self.app.get_plate(frame, None)
+                        for p_text, p_state, p_prob, p_bbox in global_plates:
+                            candidates.append({'label': "GLOBAL SCAN", 'text': p_text, 'state': p_state, 
+                                              'conf': f"{p_prob*100:.1f}%", 'bbox': p_bbox, 'prob': p_prob})
+                    
+                    frame_idx += 1
+
+                    # Spatial Sorting & Drawing
+                    candidates.sort(key=lambda x: x['prob'], reverse=True)
+                    deduped = []
+                    for cand in candidates:
+                        if any(cand['text'] == d['text'] for d in deduped): continue
+                        if any(self.app.calculate_iou(cand['bbox'], d['bbox']) > 0.4 for d in deduped): continue
+                        deduped.append(cand)
+
+                    y_off = 35
+                    ui_data = []
+                    for i, res in enumerate(deduped):
+                        pts = np.array(res['bbox'], np.int32)
+                        cv2.polylines(img_copy, [pts], True, (0, 255, 255), 2)
+                        cv2.putText(img_copy, f"#{i+1}", (res['bbox'][0][0], res['bbox'][0][1]-5), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        
+                        vehicle_type = res['label'].capitalize() if res['label'] != "GLOBAL SCAN" else "Plate"
+                        summary_text = f"#{i+1} {vehicle_type}: {res['text']} ({res['state']})"
+                        cv2.putText(img_copy, summary_text, (20, y_off), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        y_off += 28
+                        ui_data.append((res['label'], res['text'], res['state'], res['conf']))
+
+                    self.result_queue.put((img_copy, ui_data))
+                    
+                except Exception as e:
+                    logger.error(f"Live processing error: {e}")
+                    continue
+
+            except Exception as e:
+                logger.error(f"VideoProcessor run loop error: {e}")
+                time.sleep(0.1)
+
+        logger.info("Detection processor stopped")
+
 class StandaloneANPRApp:
     def __init__(self, root):
         self.root = root
@@ -45,6 +229,11 @@ class StandaloneANPRApp:
         self.current_image = None
         self.processed_image = None
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Threading/Video State
+        self.stop_event = threading.Event()
+        self.result_queue = queue.Queue(maxsize=1)
+        self.is_running = False
         
         self.create_widgets()
         
@@ -83,6 +272,7 @@ class StandaloneANPRApp:
 
         self.update_status(f"Ready. Device: {self.device.upper()}")
         self.root.after(0, lambda: self.load_btn.config(state=tk.NORMAL))
+        self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
 
     def create_widgets(self):
         # Layout
@@ -96,11 +286,24 @@ class StandaloneANPRApp:
         self.load_btn = ttk.Button(ctrl_frame, text="Select Image", command=self.load_image, state=tk.DISABLED)
         self.load_btn.pack(side=tk.LEFT, padx=5)
         
-        self.detect_btn = ttk.Button(ctrl_frame, text="Detect Vehicle & Plate", command=self.run_detection, state=tk.DISABLED)
+        self.detect_btn = ttk.Button(ctrl_frame, text="Run Detection (Static)", command=self.run_detection, state=tk.DISABLED)
         self.detect_btn.pack(side=tk.LEFT, padx=5)
         
+        ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        
+        ttk.Label(ctrl_frame, text="RTSP:").pack(side=tk.LEFT, padx=2)
+        self.rtsp_url = tk.StringVar(value="rtsp://")
+        self.rtsp_entry = ttk.Entry(ctrl_frame, textvariable=self.rtsp_url, width=30)
+        self.rtsp_entry.pack(side=tk.LEFT, padx=5)
+        
+        self.start_btn = ttk.Button(ctrl_frame, text="Start RTSP", command=self.start_rtsp, state=tk.DISABLED)
+        self.start_btn.pack(side=tk.LEFT, padx=2)
+        
+        self.stop_btn = ttk.Button(ctrl_frame, text="Stop", command=self.stop_rtsp, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=2)
+        
         self.cpu_var = tk.BooleanVar(value=(self.device == 'cpu'))
-        self.cpu_check = ttk.Checkbutton(ctrl_frame, text="Force CPU Mode (Safer)", variable=self.cpu_var, command=self.toggle_device)
+        self.cpu_check = ttk.Checkbutton(ctrl_frame, text="Force CPU Mode", variable=self.cpu_var, command=self.toggle_device)
         self.cpu_check.pack(side=tk.RIGHT, padx=5)
 
         # Middle Content
@@ -451,6 +654,66 @@ class StandaloneANPRApp:
         
         self.update_status(f"Processed {len(results)} objects.")
         self.detect_btn.config(state=tk.NORMAL)
+
+    def start_rtsp(self):
+        url = self.rtsp_url.get()
+        if not url or url == "rtsp://":
+            messagebox.showwarning("Warning", "Please enter a valid RTSP URL.")
+            return
+        
+        self.stop_event.clear()
+        self.is_running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.load_btn.config(state=tk.DISABLED)
+        self.detect_btn.config(state=tk.DISABLED)
+        
+        # Flush queue
+        while not self.result_queue.empty():
+            try: self.result_queue.get_nowait()
+            except queue.Empty: break
+            
+        self.processor_thread = threading.Thread(
+            target=ANPRVideoProcessor(self.model, self, url, self.result_queue, self.stop_event, self.device).run,
+            daemon=True
+        )
+        self.processor_thread.start()
+        self.update_status(f"RTSP Streaming: {url}")
+        self.poll_results()
+
+    def stop_rtsp(self):
+        self.stop_event.set()
+        self.is_running = False
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.load_btn.config(state=tk.NORMAL)
+        self.update_status("RTSP Stopped.")
+
+    def poll_results(self):
+        if not self.is_running:
+            return
+            
+        try:
+            # Poll multiple results if available, but take latest
+            latest_data = None
+            while True:
+                try:
+                    latest_data = self.result_queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            if latest_data:
+                img, ui_data = latest_data
+                self.display_image(img)
+                self.res_tree.delete(*self.res_tree.get_children())
+                for r in ui_data:
+                    self.res_tree.insert("", tk.END, values=r)
+                    
+        except Exception as e:
+            logger.error(f"UI Polling Error: {e}")
+            
+        if self.is_running:
+            self.root.after(30, self.poll_results)
 
 if __name__ == "__main__":
     root = tk.Tk()

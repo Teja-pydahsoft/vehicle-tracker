@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 import calendar
 import cv2
 import numpy as np
+import requests
+import tempfile
+import zipfile
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -24,6 +27,10 @@ from PySide6.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, 
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalette, QPainter, QTextCharFormat, QMovie, QImage
 
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
+
+# Application Versioning
+CURRENT_VERSION = "v1.0.4" 
+GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -512,7 +519,11 @@ class UltraModernApp(QMainWindow):
         self.init_database()
         self.init_camera_config()
         self.setup_ui()
+        # Load Configuration
         self.load_camera_config_into_ui()
+        
+        # Start Update Check (Remotely via GitHub)
+        QTimer.singleShot(5000, self.check_for_updates)
         self.start_api_server()
         
         # Update Timers
@@ -1323,6 +1334,86 @@ class UltraModernApp(QMainWindow):
             logger.info("Management report generated and opened.")
         except Exception as e:
             logger.error(f"Report generation error: {e}")
+
+    def check_for_updates(self):
+        """Check GitHub for new releases"""
+        try:
+            logger.info(f"Checking for updates... (Current: {CURRENT_VERSION})")
+            api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            response = requests.get(api_url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                latest_version = data.get('tag_name', '')
+                
+                if latest_version and latest_version != CURRENT_VERSION:
+                    logger.info(f"Update available: {latest_version}")
+                    msg = f"A NEW VERSION ({latest_version}) IS AVAILABLE!\n\nYou are currently on: {CURRENT_VERSION}\n\nWould you like to install the latest performance updates and features now?"
+                    
+                    reply = QMessageBox.question(self, "System Update Available", msg, QMessageBox.Yes | QMessageBox.No)
+                    if reply == QMessageBox.Yes:
+                        assets = data.get('assets', [])
+                        # Look for the update package
+                        update_url = None
+                        for asset in assets:
+                            if 'VehicleCounter' in asset['name'] and asset['name'].endswith('.zip'):
+                                update_url = asset['browser_download_url']
+                                break
+                        
+                        if update_url:
+                            self.perform_update(update_url, latest_version)
+                        else:
+                            # Fallback: offer to open browser
+                            QMessageBox.information(self, "Manual Update", "An update exists but no direct package was found. Opening the update page...")
+                            webbrowser.open(data.get('html_url'))
+            
+        except Exception as e:
+            logger.error(f"Remote update check failed: {e}")
+
+    def perform_update(self, url, version):
+        """Downloads and installs the update."""
+        try:
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, "update.zip")
+            
+            # Download
+            logger.info(f"Downloading update: {url}")
+            r = requests.get(url, stream=True)
+            with open(zip_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Extract
+            extract_path = os.path.join(temp_dir, "extracted")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
+            
+            # Create a separate updater script to handle file replacement
+            install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            
+            # Build the Batch Script
+            # Logic: Wait for app to close, copy all, restart main.py (or exe)
+            updater_bat = os.path.join(temp_dir, "updater.bat")
+            with open(updater_bat, "w") as f:
+                f.write(f"@echo off\n")
+                f.write(f"echo INSTALLING UPDATES... PLEASE WAIT...\n")
+                f.write(f"timeout /t 3 /nobreak > nul\n")
+                # Use xcopy to merge content
+                f.write(f"xcopy /E /Y /H /Q \"{extract_path}\\*\" \"{install_dir}\\\"\n")
+                if getattr(sys, 'frozen', False):
+                    f.write(f"start \"\" \"{sys.executable}\"\n")
+                else:
+                    python_exe = sys.executable
+                    f.write(f"start \"\" \"{python_exe}\" \"{os.path.join(install_dir, 'main.py')}\"\n")
+                f.write(f"exit\n")
+            
+            # Launch updater and exit
+            os.startfile(updater_bat)
+            self.close()
+            sys.exit(0)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Update Failed", f"An error occurred during update: {e}")
 
     def closeEvent(self, event):
         logger.info("Application closing. Terminating all background processes...")

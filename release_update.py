@@ -97,16 +97,34 @@ def main():
         return
 
     # 3. Create Zip Package
-    print("\n3. Creating Release ZIP...")
-    dist_folder = os.path.join('dist', 'VehicleCounter')
+    # 3. Create Release ZIP (Source Based for fast Remote Updates)
+    print("\n3. Creating Source-based Release ZIP...")
     zip_name = 'VehicleCounter.zip'
+    source_files = [
+        'main.py', 'vehicle_counter.py', 'multi_camera_api.py', 
+        'installer.py', 'custom_tracker.yaml', 'app_icon.ico',
+        'requirements.txt', 'build_installer.bat', 'LAUNCHER.bat'
+    ]
     
-    # Ensure dist folder exists
-    if not os.path.exists(dist_folder):
-        print(f"Error: Could not find build output at {dist_folder}")
-        return
-        
-    zip_folder(dist_folder, zip_name)
+    with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for f in source_files:
+            if os.path.exists(f):
+                print(f"Adding to ZIP: {f}")
+                zipf.write(f)
+            else:
+                print(f"Warning: File not found, skipping: {f}")
+    
+    # Check if we should still include the EXE (Optional)
+    dist_folder = os.path.join('dist', 'VehicleCounter')
+    if os.path.exists(dist_folder):
+        print("\nAdding build binaries to ZIP (this will increase size)...")
+        for root, dirs, files in os.walk(dist_folder):
+             for file in files:
+                 file_path = os.path.join(root, file)
+                 arcname = os.path.relpath(file_path, os.path.dirname(dist_folder))
+                 # Avoid double-adding source if already there
+                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zipf:
+                     zipf.write(file_path, arcname)
     
     # CHECK SPLIT LOGIC
     release_files = [zip_name]

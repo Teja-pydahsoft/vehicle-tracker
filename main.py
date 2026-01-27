@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.21" 
+CURRENT_VERSION = "v1.0.23" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -1579,18 +1579,28 @@ class UltraModernApp(QMainWindow):
                 
                 with open(updater_bat, "w") as f:
                     f.write(f"@echo off\n")
-                    f.write(f"title SYSTEM UPDATE SERVICE\n")
+                    f.write(f"title SYSTEM UPDATE SERVICE - v{version}\n")
                     f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo  AI SMART GATE - INSTALLING UPDATE v{version}\n")
+                    f.write(f"echo  AI SMART GATE - SECURE UPDATE SERVICE\n")
                     f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo Terminatiing old processes...\n")
-                    f.write(f"taskkill /F /IM python.exe /T > nul 2>&1\n")
-                    f.write(f"timeout /t 5 /nobreak > nul\n")
-                    f.write(f"echo Replacing files in: {install_dir}\n")
-                    # Robust retry logic for Robocopy
-                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:3 /W:3\n")
+                    f.write(f"echo SOURCE: {extract_path}\n")
+                    f.write(f"echo DEST  : {install_dir}\n")
                     f.write(f"echo.\n")
-                    f.write(f"echo Application has been updated. Relaunching...\n")
+                    f.write(f"echo Step 1: Terminating all application instances...\n")
+                    # Use filters to catch python.exe, pythonw.exe, etc.
+                    f.write(f"taskkill /F /FI \"IMAGENAME eq python*\" /T > nul 2>&1\n")
+                    f.write(f"timeout /t 5 /nobreak > nul\n")
+                    f.write(f"echo Step 2: Replacing system files...\n")
+                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:5 /W:3\n")
+                    f.write(f"if %ERRORLEVEL% GEQ 8 (\n")
+                    f.write(f"    echo ERROR: File replacement failed (Code %ERRORLEVEL%).\n")
+                    f.write(f"    echo This usually means a file is still locked by another program.\n")
+                    f.write(f"    echo Please close all AI windows and try again.\n")
+                    f.write(f"    pause\n")
+                    f.write(f"    exit\n")
+                    f.write(f")\n")
+                    f.write(f"echo.\n")
+                    f.write(f"echo Step 3: Launching v{version}...\n")
                     
                     if getattr(sys, 'frozen', False):
                         exe_path = os.path.join(install_dir, os.path.basename(sys.executable))
@@ -1600,7 +1610,7 @@ class UltraModernApp(QMainWindow):
                         entry_point = os.path.join(install_dir, 'main.py')
                         f.write(f"start \"\" \"{python_exe}\" \"{entry_point}\"\n")
                     
-                    f.write(f"echo Success. Close this window.\n")
+                    f.write(f"echo UPDATE SUCCESSFUL. Closing this window...\n")
                     f.write(f"timeout /t 2 > nul\n")
                     f.write(f"exit\n")
                 

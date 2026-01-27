@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.8" 
+CURRENT_VERSION = "v1.0.9" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -545,8 +545,8 @@ class UpdateOverlay(QDialog):
         
         # Shadow
         self.shadow = QGraphicsDropShadowEffect(self)
-        self.shadow.setBlurRadius(20)
-        self.shadow.setColor(QColor(0,0,0,80))
+        self.shadow.setBlurRadius(25)
+        self.shadow.setColor(QColor(0,0,0,40)) # Softer shadow for light theme
         self.container.setGraphicsEffect(self.shadow)
 
     def set_status(self, text, val=None):
@@ -558,7 +558,7 @@ class UpdateOverlay(QDialog):
 class UltraModernApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI Smart Gate - Enterprise Edition")
+        self.setWindowTitle("AI SMART GATE - MONITORING SYSTEM")
         self.resize(1600, 1000)
         self.setStyleSheet(QSS_THEME)
         
@@ -1586,7 +1586,7 @@ if __name__ == "__main__":
         
         # --- Splash Screen ---
         splash_px = QPixmap(600, 420)
-        splash_px.fill(QColor("#0f172a")) # Premium Slate Dark
+        splash_px.fill(QColor("#f8fafc")) # Clean Light Theme BG
         
         splash = QSplashScreen(splash_px)
         splash.show()
@@ -1597,19 +1597,20 @@ if __name__ == "__main__":
             painter.setRenderHint(QPainter.Antialiasing)
             
             # Background refresh
-            painter.fillRect(splash_px.rect(), QColor("#0f172a"))
+            painter.fillRect(splash_px.rect(), QColor("#f8fafc"))
             
-            # Title
+            # Title (Indigo)
             painter.setPen(QColor("#6366f1"))
             painter.setFont(QFont("Outfit", 28, QFont.Bold))
             painter.drawText(QRect(0, 100, 600, 60), Qt.AlignCenter, "AI SMART GATE")
             
-            # Subtitle
-            painter.setPen(QColor("#94a3b8"))
-            painter.setFont(QFont("Outfit", 12))
+            # Subtitle (Muted Slate)
+            painter.setPen(QColor("#64748b"))
+            painter.setFont(QFont("Outfit", 12, QFont.Bold))
             painter.drawText(QRect(0, 160, 600, 30), Qt.AlignCenter, "MONITORING SYSTEM")
             
             # Progress Message
+            painter.setPen(QColor("#0f172a")) # Dark text for visibility
             painter.setFont(QFont("Outfit", 10))
             painter.drawText(QRect(0, 280, 600, 30), Qt.AlignCenter, msg)
             
@@ -1619,7 +1620,7 @@ if __name__ == "__main__":
             bar_x = 100
             bar_y = 320
             
-            painter.setBrush(QColor("#1e293b"))
+            painter.setBrush(QColor("#e2e8f0")) # Lighter track for light theme
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 3, 3)
             

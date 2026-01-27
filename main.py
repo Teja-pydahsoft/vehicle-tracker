@@ -491,6 +491,70 @@ class CalendarDialog(QDialog):
     def get_date(self):
         return self.cal.selectedDate().toString("yyyy-MM-dd")
 
+class UpdateOverlay(QDialog):
+    def __init__(self, parent=None, version=""):
+        super().__init__(parent)
+        self.setWindowTitle("System Update")
+        self.setFixedSize(450, 200)
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        
+        layout = QVBoxLayout(self)
+        self.container = QFrame()
+        self.container.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_secondary']};
+                border-radius: 15px;
+                border: 1px solid {COLORS['border']};
+            }}
+        """)
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(30, 30, 30, 30)
+        
+        self.title = QLabel(f"INSTALLING VERSION {version}")
+        self.title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {COLORS['primary']};")
+        self.title.setAlignment(Qt.AlignCenter)
+        
+        self.status = QLabel("Downloading secure package...")
+        self.status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        self.status.setAlignment(Qt.AlignCenter)
+        
+        self.progress = QProgressBar()
+        self.progress.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {COLORS['bg_hover']};
+                border: none;
+                border_radius: 5px;
+                height: 10px;
+                text-align: center;
+            }}
+            QProgressBar::chunk {{
+                background-color: {COLORS['primary']};
+                border_radius: 5px;
+            }}
+        """)
+        self.progress.setRange(0, 0) # Pulse
+        
+        container_layout.addWidget(self.title)
+        container_layout.addSpacing(10)
+        container_layout.addWidget(self.status)
+        container_layout.addSpacing(20)
+        container_layout.addWidget(self.progress)
+        
+        layout.addWidget(self.container)
+        
+        # Shadow
+        self.shadow = QGraphicsDropShadowEffect(self)
+        self.shadow.setBlurRadius(20)
+        self.shadow.setColor(QColor(0,0,0,80))
+        self.container.setGraphicsEffect(self.shadow)
+
+    def set_status(self, text, val=None):
+        self.status.setText(text)
+        if val is not None:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(val)
+
 class UltraModernApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1371,49 +1435,68 @@ class UltraModernApp(QMainWindow):
             logger.error(f"Remote update check failed: {e}")
 
     def perform_update(self, url, version):
-        """Downloads and installs the update."""
-        try:
-            temp_dir = tempfile.mkdtemp()
-            zip_path = os.path.join(temp_dir, "update.zip")
-            
-            # Download
-            logger.info(f"Downloading update: {url}")
-            r = requests.get(url, stream=True)
-            with open(zip_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            # Extract
-            extract_path = os.path.join(temp_dir, "extracted")
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_path)
-            
-            # Create a separate updater script to handle file replacement
-            install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-            
-            # Build the Batch Script
-            # Logic: Wait for app to close, copy all, restart main.py (or exe)
-            updater_bat = os.path.join(temp_dir, "updater.bat")
-            with open(updater_bat, "w") as f:
-                f.write(f"@echo off\n")
-                f.write(f"echo INSTALLING UPDATES... PLEASE WAIT...\n")
-                f.write(f"timeout /t 3 /nobreak > nul\n")
-                # Use xcopy to merge content
-                f.write(f"xcopy /E /Y /H /Q \"{extract_path}\\*\" \"{install_dir}\\\"\n")
-                if getattr(sys, 'frozen', False):
-                    f.write(f"start \"\" \"{sys.executable}\"\n")
-                else:
-                    python_exe = sys.executable
-                    f.write(f"start \"\" \"{python_exe}\" \"{os.path.join(install_dir, 'main.py')}\"\n")
-                f.write(f"exit\n")
-            
-            # Launch updater and exit
-            os.startfile(updater_bat)
-            self.close()
-            sys.exit(0)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Update Failed", f"An error occurred during update: {e}")
+        """Downloads and installs the update with a UI overlay."""
+        overlay = UpdateOverlay(self, version)
+        overlay.show()
+        QApplication.processEvents()
+
+        def run_task():
+            try:
+                temp_dir = tempfile.mkdtemp()
+                zip_path = os.path.join(temp_dir, "update.zip")
+                
+                # Download
+                r = requests.get(url, stream=True)
+                total_size = int(r.headers.get('content-length', 0))
+                downloaded = 0
+                
+                with open(zip_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                percent = int((downloaded / total_size) * 100)
+                                overlay.set_status(f"Downloading: {percent}%", percent)
+                                QApplication.processEvents()
+                
+                overlay.set_status("Verifying & Extracting...", 100)
+                overlay.progress.setRange(0, 0) # Pulse back
+                QApplication.processEvents()
+                
+                # Extract
+                extract_path = os.path.join(temp_dir, "extracted")
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_path)
+                
+                overlay.set_status("Applying changes... App will restart.")
+                QApplication.processEvents()
+                time.sleep(1) # Let user see it
+                
+                # Final Batch Script
+                install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+                updater_bat = os.path.join(temp_dir, "updater.bat")
+                with open(updater_bat, "w") as f:
+                    f.write(f"@echo off\n")
+                    f.write(f"timeout /t 2 /nobreak > nul\n")
+                    f.write(f"xcopy /E /Y /H /Q \"{extract_path}\\*\" \"{install_dir}\\\"\n")
+                    if getattr(sys, 'frozen', False):
+                        f.write(f"start \"\" \"{sys.executable}\"\n")
+                    else:
+                        python_exe = sys.executable
+                        f.write(f"start \"\" \"{python_exe}\" \"{os.path.join(install_dir, 'main.py')}\"\n")
+                    f.write(f"exit\n")
+                
+                os.startfile(updater_bat)
+                self.close()
+                sys.exit(0)
+                
+            except Exception as e:
+                overlay.close()
+                QMessageBox.critical(self, "Update Failed", f"An error occurred: {e}")
+
+        # Run in a small delay to let UI render
+        QTimer.singleShot(500, run_task)
 
     def closeEvent(self, event):
         logger.info("Application closing. Terminating all background processes...")

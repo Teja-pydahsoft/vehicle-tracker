@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.10" 
+CURRENT_VERSION = "v1.0.11" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging

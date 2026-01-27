@@ -1,0 +1,61 @@
+# --- AI / Machine Learning ---
+*.pt
+*.onnx
+*.weights
+/models/
+/runs/
+/train/
+/valid/
+/test/
+
+# --- Large Binaries & Assets ---
+cloudflared.exe
+cloudflared.msi
+VehicleCounter.zip*
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webp
+*.zip
+*.001
+*.002
+*.003
+
+# --- Database & Logs ---
+*.db
+*.db-journal
+*.log
+/shared_frames/
+gate_log.db
+
+# --- Python / Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+env/
+venv/
+.env
+.venv/
+
+# --- Build & Distribution ---
+/build/
+/dist/
+*.spec
+VehicleCounter/
+
+# --- Temporary & Local Files ---
+*.docx
+temp/
+tmp/
+*.bak
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# --- Exceptions (Files we DO want to keep) ---
+!app_icon.ico
+!requirements.txt
+!custom_tracker.yaml
+!camera_config.example.json

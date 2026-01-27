@@ -1,0 +1,27 @@
+# Required for AI Detection
+ultralytics>=8.0.0
+torch
+torchvision
+torchaudio
+
+# Required for API & Dashboard
+fastapi
+uvicorn
+jinja2
+python-multipart
+
+# Required for Data & ANPR
+easyocr
+opencv-python
+pandas
+numpy
+sqlite3
+
+# Required for Reporting & UI
+python-docx
+Pillow
+tabulate
+psutil
+PySide6
+matplotlib
+lapx

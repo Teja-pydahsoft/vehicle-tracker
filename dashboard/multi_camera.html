@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Camera Vehicle Tracking Dashboard</title>
+    <link rel="stylesheet" href="multi_camera.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <!-- Sidebar Navigation -->
+    <div class="sidebar" id="sidebar">
+        <div class="logo">
+            <i class="fas fa-shield-halved"></i>
+            <span>SMART GATE</span>
+        </div>
+        <nav>
+            <a href="#" id="nav-dashboard" class="active" onclick="switchView('dashboard')">
+                <i class="fas fa-grid-2"></i>
+                <span>Live Dashboard</span>
+            </a>
+            <a href="#" id="nav-cameras" onclick="switchView('cameras')">
+                <i class="fas fa-video"></i>
+                <span>Camera Grid</span>
+            </a>
+            <a href="#" id="nav-config" onclick="switchView('config')">
+                <i class="fas fa-sliders"></i>
+                <span>Configuration</span>
+            </a>
+            <a href="#" id="nav-history" onclick="switchView('history')">
+                <i class="fas fa-clock-rotate-left"></i>
+                <span>History</span>
+            </a>
+            <a href="#" id="nav-analytics" onclick="switchView('analytics')">
+                <i class="fas fa-chart-line"></i>
+                <span>Analytics</span>
+            </a>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="system-status">
+                <i class="fas fa-circle status-indicator"></i>
+                <span>System Active</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="content">
+        <!-- Header -->
+        <header>
+            <div class="header-left">
+                <button id="sidebar-toggle" onclick="toggleSidebar()">
+                    <i class="fas fa-bars"></i>
+                </button>
+                <h1 id="page-title">Multi-Camera Dashboard</h1>
+            </div>
+            <div class="header-right">
+                <div class="header-stats">
+                    <div class="mini-stat">
+                        <i class="fas fa-camera"></i>
+                        <span id="active-cameras">0/4</span>
+                    </div>
+                    <div class="mini-stat">
+                        <i class="fas fa-car"></i>
+                        <span id="total-vehicles">0</span>
+                    </div>
+                </div>
+                <button class="notification-btn">
+                    <i class="fas fa-bell"></i>
+                    <span class="badge">3</span>
+                </button>
+                <div class="user-profile">
+                    <div class="avatar">A</div>
+                    <span>Admin</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Dashboard View -->
+        <div id="dashboard-view" class="view-container">
+            <!-- Quick Stats -->
+            <section class="stats-grid">
+                <div class="stat-card primary">
+                    <div class="stat-icon">
+                        <i class="fas fa-arrow-right-to-bracket"></i>
+                    </div>
+                    <div class="stat-content">
+                        <h3>Total IN</h3>
+                        <p class="stat-value" id="stat-total-in">0</p>
+                        <span class="stat-trend positive">
+                            <i class="fas fa-arrow-up"></i> 12% today
+                        </span>
+                    </div>
+                </div>
+
+                <div class="stat-card success">
+                    <div class="stat-icon">
+                        <i class="fas fa-arrow-right-from-bracket"></i>
+                    </div>
+                    <div class="stat-content">
+                        <h3>Total OUT</h3>
+                        <p class="stat-value" id="stat-total-out">0</p>
+                        <span class="stat-trend positive">
+                            <i class="fas fa-arrow-up"></i> 8% today
+                        </span>
+                    </div>
+                </div>
+
+                <div class="stat-card warning">
+                    <div class="stat-icon">
+                        <i class="fas fa-video"></i>
+                    </div>
+                    <div class="stat-content">
+                        <h3>Active Cameras</h3>
+                        <p class="stat-value" id="stat-active-cameras">0</p>
+                        <span class="stat-label">of 4 configured</span>
+                    </div>
+                </div>
+
+                <div class="stat-card info">
+                    <div class="stat-icon">
+                        <i class="fas fa-gauge-high"></i>
+                    </div>
+                    <div class="stat-content">
+                        <h3>Avg FPS</h3>
+                        <p class="stat-value" id="stat-avg-fps">0</p>
+                        <span class="stat-label">across all cameras</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Camera Status Overview -->
+            <section class="camera-overview">
+                <h2>Camera Status</h2>
+                <div class="camera-status-grid" id="camera-status-grid">
+                    <!-- Camera status cards will be inserted here -->
+                </div>
+            </section>
+
+            <!-- Recent Activity -->
+            <section class="recent-activity">
+                <div class="section-header">
+                    <h2>Recent Detections</h2>
+                    <button onclick="refreshData()" class="refresh-btn">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                </div>
+                <div class="activity-table-container">
+                    <table class="activity-table">
+                        <thead>
+                            <tr>
+                                <th>Camera</th>
+                                <th>Vehicle Type</th>
+                                <th>Plate Number</th>
+                                <th>State</th>
+                                <th>Direction</th>
+                                <th>Time</th>
+                                <th>Confidence</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recent-activity-body">
+                            <!-- Recent activity rows -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+
+        <!-- Camera Grid View -->
+        <div id="cameras-view" class="view-container" style="display: none;">
+            <div class="view-controls">
+                <button onclick="startAllCameras()" class="control-btn success">
+                    <i class="fas fa-play"></i> Start All
+                </button>
+                <button onclick="stopAllCameras()" class="control-btn danger">
+                    <i class="fas fa-stop"></i> Stop All
+                </button>
+                <button onclick="toggleFullscreen()" class="control-btn">
+                    <i class="fas fa-expand"></i> Fullscreen
+                </button>
+            </div>
+
+            <div class="camera-grid" id="camera-grid">
+                <!-- Camera feeds will be inserted here -->
+            </div>
+        </div>
+
+        <!-- Configuration View -->
+        <div id="config-view" class="view-container" style="display: none;">
+            <div class="config-container">
+                <div class="config-header">
+                    <h2>Camera Configuration</h2>
+                    <button onclick="saveConfiguration()" class="save-btn">
+                        <i class="fas fa-save"></i> Save Configuration
+                    </button>
+                </div>
+
+                <div class="camera-config-grid" id="camera-config-grid">
+                    <!-- Camera configuration cards -->
+                </div>
+
+                <div class="global-settings">
+                    <h3>Global Settings</h3>
+                    <div class="settings-grid">
+                        <div class="setting-item">
+                            <label>Detection Confidence Threshold</label>
+                            <input type="range" id="confidence-threshold" min="0" max="100" value="25" step="1">
+                            <span id="confidence-value">25%</span>
+                        </div>
+                        <div class="setting-item">
+                            <label>Frame Processing Rate</label>
+                            <select id="processing-rate">
+                                <option value="1">Every Frame</option>
+                                <option value="2" selected>Every 2nd Frame</option>
+                                <option value="3">Every 3rd Frame</option>
+                                <option value="5">Every 5th Frame</option>
+                            </select>
+                        </div>
+                        <div class="setting-item">
+                            <label>Auto-Restart on Failure</label>
+                            <input type="checkbox" id="auto-restart" checked>
+                        </div>
+                        <div class="setting-item">
+                            <label>Enable OCR (Number Plate Recognition)</label>
+                            <input type="checkbox" id="enable-ocr" checked>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- History View -->
+        <div id="history-view" class="view-container" style="display: none;">
+            <section class="filters-section">
+                <h3>Filter Options</h3>
+                <div class="filters-grid">
+                    <div class="filter-item">
+                        <label>Camera</label>
+                        <select id="filter-camera">
+                            <option value="all">All Cameras</option>
+                            <option value="1">Camera 1</option>
+                            <option value="2">Camera 2</option>
+                            <option value="3">Camera 3</option>
+                            <option value="4">Camera 4</option>
+                        </select>
+                    </div>
+                    <div class="filter-item">
+                        <label>Vehicle Type</label>
+                        <select id="filter-type">
+                            <option value="all">All Types</option>
+                            <option value="car">Car</option>
+                            <option value="truck">Truck</option>
+                            <option value="bus">Bus</option>
+                            <option value="motorcycle">Motorcycle</option>
+                        </select>
+                    </div>
+                    <div class="filter-item">
+                        <label>Plate Number</label>
+                        <input type="text" id="filter-plate" placeholder="Enter plate...">
+                    </div>
+                    <div class="filter-item">
+                        <label>Start Date</label>
+                        <input type="date" id="filter-start-date">
+                    </div>
+                    <div class="filter-item">
+                        <label>End Date</label>
+                        <input type="date" id="filter-end-date">
+                    </div>
+                    <div class="filter-item">
+                        <button onclick="applyFilters()" class="apply-btn">
+                            <i class="fas fa-search"></i> Search
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="history-table-section">
+                <div class="section-header">
+                    <h2>Detection History</h2>
+                    <div class="export-buttons">
+                        <button onclick="exportToCSV()" class="export-btn">
+                            <i class="fas fa-file-csv"></i> Export CSV
+                        </button>
+                        <button onclick="exportToPDF()" class="export-btn">
+                            <i class="fas fa-file-pdf"></i> Export PDF
+                        </button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table class="history-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Camera</th>
+                                <th>Vehicle Type</th>
+                                <th>Plate Number</th>
+                                <th>State</th>
+                                <th>Direction</th>
+                                <th>Timestamp</th>
+                                <th>Confidence</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table-body">
+                            <!-- History data -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+
+        <!-- Analytics View -->
+        <div id="analytics-view" class="view-container" style="display: none;">
+            <section class="filters-section">
+                <h3>Analysis Period & Filters</h3>
+                <div class="filters-grid">
+                    <div class="filter-item">
+                        <label>Camera</label>
+                        <select id="ana-filter-camera">
+                            <option value="all">All Cameras</option>
+                            <option value="1">Camera 1</option>
+                            <option value="2">Camera 2</option>
+                            <option value="3">Camera 3</option>
+                            <option value="4">Camera 4</option>
+                        </select>
+                    </div>
+                    <div class="filter-item">
+                        <label>Vehicle Type</label>
+                        <select id="ana-filter-type">
+                            <option value="all">All Types</option>
+                            <option value="car">Car</option>
+                            <option value="truck">Truck</option>
+                            <option value="bus">Bus</option>
+                            <option value="motorcycle">Motorcycle</option>
+                        </select>
+                    </div>
+                    <div class="filter-item">
+                        <label>Direction</label>
+                        <select id="ana-filter-dir">
+                            <option value="all">All Status</option>
+                            <option value="IN">IN</option>
+                            <option value="OUT">OUT</option>
+                        </select>
+                    </div>
+                    <div class="filter-item">
+                        <label>Start Date</label>
+                        <input type="date" id="ana-filter-start-date">
+                    </div>
+                    <div class="filter-item">
+                        <label>End Date</label>
+                        <input type="date" id="ana-filter-end-date">
+                    </div>
+                    <div class="filter-item">
+                        <button onclick="loadAnalytics()" class="apply-btn">
+                            <i class="fas fa-sync-alt"></i> Update Stats
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <div class="analytics-grid">
+                <div class="chart-card">
+                    <h3>Hourly Traffic Flow</h3>
+                    <canvas id="hourly-chart"></canvas>
+                </div>
+                <div class="chart-card">
+                    <h3>Vehicle Type Distribution</h3>
+                    <canvas id="type-chart"></canvas>
+                </div>
+                <div class="chart-card">
+                    <h3>Camera Performance</h3>
+                    <canvas id="camera-performance-chart"></canvas>
+                </div>
+                <div class="chart-card">
+                    <h3>Daily Trend</h3>
+                    <canvas id="daily-trend-chart"></canvas>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Login Modal -->
+    <div id="login-modal" class="modal-overlay" style="display: flex;">
+        <div class="login-card">
+            <div class="login-header">
+                <i class="fas fa-shield-halved"></i>
+                <h2>SMART GATE</h2>
+                <p>Secure Access Control</p>
+            </div>
+            <form id="login-form" onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label><i class="fas fa-user"></i> Username</label>
+                    <input type="text" id="login-username" placeholder="Enter username" required>
+                </div>
+                <div class="form-group">
+                    <label><i class="fas fa-lock"></i> Password</label>
+                    <input type="password" id="login-password" placeholder="Enter password" required>
+                </div>
+                <button type="submit" class="login-btn">
+                    <i class="fas fa-right-to-bracket"></i> Login
+                </button>
+                <div id="login-error" class="error-msg"></div>
+            </form>
+        </div>
+    </div>
+
+    <style>
+        /* Login Modal Styles */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.95);
+            z-index: 9999;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            backdrop-filter: blur(5px);
+        }
+
+        .login-card {
+            background: var(--bg-card);
+            padding: 40px;
+            border-radius: 16px;
+            width: 100%;
+            max-width: 400px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            border: 1px solid var(--border);
+            text-align: center;
+        }
+
+        .login-header {
+            margin-bottom: 30px;
+        }
+
+        .login-header i {
+            font-size: 48px;
+            color: var(--accent);
+            margin-bottom: 15px;
+        }
+
+        .login-header h2 {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin: 0;
+        }
+
+        .login-header p {
+            color: var(--text-muted);
+            margin-top: 5px;
+        }
+
+        .login-btn {
+            width: 100%;
+            padding: 12px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-top: 20px;
+        }
+
+        .login-btn:hover {
+            background: var(--accent-hover);
+            transform: translateY(-1px);
+        }
+
+        .error-msg {
+            color: var(--danger);
+            margin-top: 15px;
+            font-size: 14px;
+            min-height: 20px;
+        }
+    </style>
+
+    <script src="multi_camera.js"></script>
+</body>
+
+</html>

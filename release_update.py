@@ -7,7 +7,7 @@ import webbrowser
 import sys
 
 def get_current_version(file_path):
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
     match = re.search(r'CURRENT_VERSION\s*=\s*"([^"]+)"', content)
     if match:
@@ -15,7 +15,7 @@ def get_current_version(file_path):
     return None
 
 def update_version(file_path, new_version):
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
     
     new_content = re.sub(
@@ -24,7 +24,7 @@ def update_version(file_path, new_version):
         content
     )
     
-    with open(file_path, 'w') as f:
+    with open(file_path, 'w', encoding='utf-8') as f:
         f.write(new_content)
 
 def zip_folder(folder_path, output_path):

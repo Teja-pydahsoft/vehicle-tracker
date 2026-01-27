@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.13" 
+CURRENT_VERSION = "v1.0.14" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -554,6 +554,105 @@ class UpdateOverlay(QDialog):
         if val is not None:
             self.progress.setRange(0, 100)
             self.progress.setValue(val)
+
+class UpdatePromptDialog(QDialog):
+    def __init__(self, parent=None, version=""):
+        super().__init__(parent)
+        self.setWindowTitle("System Update Available")
+        self.setFixedSize(480, 260)
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.result_status = False
+        
+        layout = QVBoxLayout(self)
+        self.container = QFrame()
+        self.container.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_secondary']};
+                border-radius: 20px;
+                border: 2px solid {COLORS['primary']};
+            }}
+        """)
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(35, 35, 35, 35)
+        
+        # Icon/Header
+        self.icon_lbl = QLabel("󰚰") # Update Icon (Bootstrap/Material style)
+        self.icon_lbl.setStyleSheet(f"font-size: 48px; color: {COLORS['primary']}; font-family: 'Segoe UI Symbol';")
+        self.icon_lbl.setAlignment(Qt.AlignCenter)
+        
+        self.title = QLabel("SYSTEM UPGRADE AVAILABLE")
+        self.title.setStyleSheet(f"font-size: 16px; font-weight: 900; color: {COLORS['text_primary']};")
+        self.title.setAlignment(Qt.AlignCenter)
+        
+        self.desc = QLabel(f"A new version <b>{version}</b> is ready with enhanced performance and features. Would you like to update now?")
+        self.desc.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
+        self.desc.setWordWrap(True)
+        self.desc.setAlignment(Qt.AlignCenter)
+        
+        btn_layout = QHBoxLayout()
+        self.yes_btn = QPushButton("UPGRADE NOW")
+        self.yes_btn.setCursor(Qt.PointingHandCursor)
+        self.yes_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['primary']};
+                color: white;
+                border-radius: 8px;
+                padding: 12px 20px;
+                font-weight: 800;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['primary_dark']};
+            }}
+        """)
+        
+        self.no_btn = QPushButton("LATER")
+        self.no_btn.setCursor(Qt.PointingHandCursor)
+        self.no_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {COLORS['text_muted']};
+                border: 1px solid {COLORS['border']};
+                border_radius: 8px;
+                padding: 12px 20px;
+                font-weight: 700;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['bg_hover']};
+            }}
+        """)
+        
+        self.yes_btn.clicked.connect(self.do_yes)
+        self.no_btn.clicked.connect(self.do_no)
+        
+        btn_layout.addWidget(self.no_btn)
+        btn_layout.addSpacing(10)
+        btn_layout.addWidget(self.yes_btn)
+        
+        container_layout.addWidget(self.icon_lbl)
+        container_layout.addWidget(self.title)
+        container_layout.addSpacing(10)
+        container_layout.addWidget(self.desc)
+        container_layout.addSpacing(25)
+        container_layout.addLayout(btn_layout)
+        
+        layout.addWidget(self.container)
+        
+        # Shadow
+        self.shadow = QGraphicsDropShadowEffect(self)
+        self.shadow.setBlurRadius(30)
+        self.shadow.setColor(QColor(0,0,0,50))
+        self.container.setGraphicsEffect(self.shadow)
+
+    def do_yes(self):
+        self.result_status = True
+        self.accept()
+        
+    def do_no(self):
+        self.result_status = False
+        self.reject()
 
 class UltraModernApp(QMainWindow):
     def __init__(self):
@@ -1412,12 +1511,10 @@ class UltraModernApp(QMainWindow):
                 
                 if latest_version and latest_version != CURRENT_VERSION:
                     logger.info(f"Update available: {latest_version}")
-                    msg = f"A NEW VERSION ({latest_version}) IS AVAILABLE!\n\nYou are currently on: {CURRENT_VERSION}\n\nWould you like to install the latest performance updates and features now?"
                     
-                    reply = QMessageBox.question(self, "System Update Available", msg, QMessageBox.Yes | QMessageBox.No)
-                    if reply == QMessageBox.Yes:
+                    dialog = UpdatePromptDialog(self, latest_version)
+                    if dialog.exec() == QDialog.Accepted:
                         assets = data.get('assets', [])
-                        # Look for the update package
                         update_url = None
                         for asset in assets:
                             if 'VehicleCounter' in asset['name'] and asset['name'].endswith('.zip'):
@@ -1427,8 +1524,8 @@ class UltraModernApp(QMainWindow):
                         if update_url:
                             self.perform_update(update_url, latest_version)
                         else:
-                            # Fallback: offer to open browser
-                            QMessageBox.information(self, "Manual Update", "An update exists but no direct package was found. Opening the update page...")
+                            QMessageBox.information(self, "Manual Update", "Direct package not found. Opening update page...")
+                            import webbrowser
                             webbrowser.open(data.get('html_url'))
             
         except Exception as e:
@@ -1461,53 +1558,56 @@ class UltraModernApp(QMainWindow):
                                 QApplication.processEvents()
                 
                 overlay.set_status("Verifying & Extracting...", 100)
-                overlay.progress.setRange(0, 0) # Pulse back
+                overlay.progress.setRange(0, 0)
                 QApplication.processEvents()
                 
                 # Extract
                 extract_path = os.path.join(temp_dir, "extracted")
+                os.makedirs(extract_path, exist_ok=True)
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(extract_path)
                 
                 overlay.set_status("Applying changes... App will restart.")
                 QApplication.processEvents()
-                time.sleep(1) # Let user see it
+                time.sleep(1)
                 
-                # Final Batch Script (Powerful & Visible)
+                # Final Batch Script (Robust Fix)
                 install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
                 updater_bat = os.path.join(temp_dir, "updater.bat")
+                
                 with open(updater_bat, "w") as f:
                     f.write(f"@echo off\n")
-                    f.write(f"title SYSTEM UPDATE IN PROGRESS\n")
+                    f.write(f"title SYSTEM UPDATE SERVICE\n")
                     f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo  AI SMART GATE - SECURE UPDATE SERVICE\n")
+                    f.write(f"echo  AI SMART GATE - INSTALLING UPDATE v{version}\n")
                     f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo Waiting for application to close...\n")
+                    f.write(f"echo Waiting for processes to unlock...\n")
                     f.write(f"timeout /t 3 /nobreak > nul\n")
-                    f.write(f"echo Installing new files to: {install_dir}\n")
-                    # Robocopy is much more robust for Program Files
-                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:3 /W:5\n")
-                    f.write(f"echo Update complete!\n")
-                    f.write(f"echo Restarting application...\n")
+                    f.write(f"echo Replacing files in: {install_dir}\n")
+                    # Robocopy /MOVE or /MIR but be careful. /E /IS /IT is safe.
+                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:5 /W:5\n")
+                    f.write(f"echo.\n")
+                    f.write(f"echo Starting new version...\n")
+                    
                     if getattr(sys, 'frozen', False):
                         f.write(f"start \"\" \"{sys.executable}\"\n")
                     else:
                         python_exe = sys.executable
                         f.write(f"start \"\" \"{python_exe}\" \"{os.path.join(install_dir, 'main.py')}\"\n")
-                    f.write(f"echo SUCCESS. This window will close automatically.\n")
+                    
+                    f.write(f"echo SUCCESS! This window will close.\n")
                     f.write(f"timeout /t 2 > nul\n")
                     f.write(f"exit\n")
                 
-                # Launch in a visible window so we can see if it fails
-                subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/k', updater_bat], shell=True)
+                # Use subprocess to launch cmd with proper priority
+                subprocess.Popen(['cmd.exe', '/c', 'start', '/high', 'cmd.exe', '/c', updater_bat], shell=True)
                 self.close()
                 sys.exit(0)
                 
             except Exception as e:
                 overlay.close()
-                QMessageBox.critical(self, "Update Failed", f"An error occurred: {e}")
+                QMessageBox.critical(self, "Update Failed", f"Update error: {e}")
 
-        # Run in a small delay to let UI render
         QTimer.singleShot(500, run_task)
 
     def closeEvent(self, event):

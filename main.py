@@ -1584,28 +1584,30 @@ class UltraModernApp(QMainWindow):
                     f.write(f"echo  SYSTEM UPGRADE IN PROGRESS\n")
                     f.write(f"echo ------------------------------------------\n")
                     f.write(f"echo.\n")
-                    f.write(f"echo [1/3] Closing all system processes...\n")
-                    # Triple-kill to be absolutely sure
+                    f.write(f"echo [1/3] Clearing process locks...\n")
+                    f.write(f"taskkill /F /FI \"IMAGENAME eq python*\" /T > nul 2>&1\n")
                     f.write(f"taskkill /F /FI \"IMAGENAME eq python*\" /T > nul 2>&1\n")
                     f.write(f"timeout /t 5 /nobreak > nul\n")
                     
-                    f.write(f"echo [2/3] Cleaning old files...\n")
-                    # Force delete key files to check for locks
-                    f.write(f"del /f /q \"{os.path.join(install_dir, 'main.py')}\" > nul 2>&1\n")
-                    f.write(f"del /f /q \"{os.path.join(install_dir, 'vehicle_counter.py')}\" > nul 2>&1\n")
+                    f.write(f"echo [2/3] Preparing system for new assets...\n")
+                    # Renaming is more reliable than deleting on Windows
+                    f.write(f"move /y \"{os.path.join(install_dir, 'main.py')}\" \"{os.path.join(install_dir, 'main.py.old')}\" > nul 2>&1\n")
+                    f.write(f"move /y \"{os.path.join(install_dir, 'vehicle_counter.py')}\" \"{os.path.join(install_dir, 'vehicle_counter.py.old')}\" > nul 2>&1\n")
                     
-                    f.write(f"echo [3/3] Installing new enterprise assets...\n")
+                    f.write(f"echo [3/3] Installing v{version}...\n")
                     f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:10 /W:2\n")
                     
                     f.write(f"if %ERRORLEVEL% GEQ 8 (\n")
-                    f.write(f"    echo ERROR: Critical failure during file replacement.\n")
-                    f.write(f"    echo Please manually close all AI windows and run the app again.\n")
+                    f.write(f"    echo [FATAL] File replacement failed with Error %ERRORLEVEL%.\n")
+                    f.write(f"    echo Attempting to restore old version...\n")
+                    f.write(f"    move /y \"{os.path.join(install_dir, 'main.py.old')}\" \"{os.path.join(install_dir, 'main.py')}\" > nul 2>&1\n")
                     f.write(f"    pause\n")
                     f.write(f"    exit\n")
                     f.write(f")\n")
                     
                     f.write(f"echo.\n")
-                    f.write(f"echo UPGRADE SUCCESSFUL! Relaunching v{version}...\n")
+                    f.write(f"echo UPGRADE SUCCESSFUL! Relaunching system...\n")
+                    f.write(f"del /q \"{os.path.join(install_dir, '*.old')}\" > nul 2>&1\n")
                     
                     if getattr(sys, 'frozen', False):
                         exe_path = os.path.join(install_dir, os.path.basename(sys.executable))

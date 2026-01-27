@@ -189,7 +189,7 @@ class InstallWorker(QThread):
             launcher_path = os.path.join(self.target_dir, "LAUNCHER.bat")
             with open(launcher_path, "w") as f:
                 # Use python.exe (not pythonw.exe) to ensure terminal stays visible for logs
-                f.write(f"@echo off\ncd /d \"%~dp0\"\n\"env\\Scripts\\python.exe\" main.py\npause\n")
+                f.write(f"@echo off\ncd /d \"%~dp0\"\nstart \"\" \"env\\Scripts\\python.exe\" main.py\nexit\n")
 
             icon_p = os.path.join(self.target_dir, 'app_icon.ico')
             ps_cmd = f"$s=(New-Object -COM WScript.Shell).CreateShortcut('{shortcut_path}');$s.TargetPath='{launcher_path}';$s.WorkingDirectory='{self.target_dir}';$s.IconLocation='{icon_p}';$s.Save()"

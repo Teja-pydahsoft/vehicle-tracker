@@ -73,28 +73,11 @@ def main():
     # 1. Update Version in Code
     print(f"\n1. Updating code version to {new_ver}...")
     update_version(target_file, new_ver)
+    update_version('main.py', new_ver)
     
-    # 2. Build EXE
-    print("\n2. Building Executable (this may take a few minutes)...")
-    build_cmd = [
-        'pyinstaller',
-        '--noconfirm',
-        '--onedir',
-        '--console',
-        '--clean',
-        '--name', 'VehicleCounter',
-        '--add-data', 'custom_tracker.yaml;.',
-        '--add-data', 'models;models',
-        '--collect-all', 'ultralytics',
-        '--collect-all', 'easyocr',
-        'vehicle_counter.py'
-    ]
-    
-    try:
-        subprocess.check_call(build_cmd, shell=True)
-    except subprocess.CalledProcessError:
-        print("Error: Build failed!")
-        return
+    # 2. Skip Heavy EXE Build
+    print("\n2. Skipping PyInstaller build (Source-only update mode)...")
+    print("Benefit: Your update will be ~2MB instead of 2GB!")
 
     # 3. Create Zip Package
     # 3. Create Release ZIP (Source Based for fast Remote Updates)
@@ -151,8 +134,8 @@ def main():
     
     # 4. Git Operations
     try:
-        subprocess.check_call(['git', 'add', target_file], shell=True)
-        subprocess.check_call(['git', 'commit', '-m', f"Release version {new_ver}"], shell=True)
+        subprocess.check_call(['git', 'add', 'main.py', 'vehicle_counter.py', 'installer.py', 'release_update.py'], shell=True)
+        subprocess.check_call(['git', 'commit', '-m', f"Release {new_ver}"], shell=True)
         subprocess.check_call(['git', 'push'], shell=True)
         print("Git Push Complete.")
     except Exception as e:

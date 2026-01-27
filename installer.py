@@ -145,6 +145,21 @@ class InstallWorker(QThread):
             self.log.emit("SUCCESS > AI Core initialized.", "#10b981")
             self.percent.emit(end_p)
 
+            # --- FORCE CLEAN INSTALL ---
+            self.progress.emit("Cleaning existing installation...")
+            try:
+                import psutil
+                # Force kill any running instances that might block file copying
+                for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                    try:
+                        cmdline = proc.info.get('cmdline')
+                        if cmdline and ("main.py" in " ".join(cmdline) or "vehicle_counter.py" in " ".join(cmdline)):
+                            self.log.emit(f"Terminating running process: {proc.info['pid']}", "#f59e0b")
+                            proc.terminate()
+                            proc.wait(timeout=3)
+                    except: pass
+            except: pass
+
             # Step 3: Assets
             self.progress.emit("Step 4/5: Deploying Application Assets...")
             os.makedirs(os.path.join(self.target_dir, "shared_frames"), exist_ok=True)

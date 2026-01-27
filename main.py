@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.9" 
+CURRENT_VERSION = "v1.0.10" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -1473,21 +1473,33 @@ class UltraModernApp(QMainWindow):
                 QApplication.processEvents()
                 time.sleep(1) # Let user see it
                 
-                # Final Batch Script
+                # Final Batch Script (Powerful & Visible)
                 install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
                 updater_bat = os.path.join(temp_dir, "updater.bat")
                 with open(updater_bat, "w") as f:
                     f.write(f"@echo off\n")
-                    f.write(f"timeout /t 2 /nobreak > nul\n")
-                    f.write(f"xcopy /E /Y /H /Q \"{extract_path}\\*\" \"{install_dir}\\\"\n")
+                    f.write(f"title SYSTEM UPDATE IN PROGRESS\n")
+                    f.write(f"echo ------------------------------------------\n")
+                    f.write(f"echo  AI SMART GATE - SECURE UPDATE SERVICE\n")
+                    f.write(f"echo ------------------------------------------\n")
+                    f.write(f"echo Waiting for application to close...\n")
+                    f.write(f"timeout /t 3 /nobreak > nul\n")
+                    f.write(f"echo Installing new files to: {install_dir}\n")
+                    # Robocopy is much more robust for Program Files
+                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:3 /W:5\n")
+                    f.write(f"echo Update complete!\n")
+                    f.write(f"echo Restarting application...\n")
                     if getattr(sys, 'frozen', False):
                         f.write(f"start \"\" \"{sys.executable}\"\n")
                     else:
                         python_exe = sys.executable
                         f.write(f"start \"\" \"{python_exe}\" \"{os.path.join(install_dir, 'main.py')}\"\n")
+                    f.write(f"echo SUCCESS. This window will close automatically.\n")
+                    f.write(f"timeout /t 2 > nul\n")
                     f.write(f"exit\n")
                 
-                os.startfile(updater_bat)
+                # Launch in a visible window so we can see if it fails
+                subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/k', updater_bat], shell=True)
                 self.close()
                 sys.exit(0)
                 

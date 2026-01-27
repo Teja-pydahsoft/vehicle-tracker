@@ -86,7 +86,7 @@ def main():
     source_files = [
         'main.py', 'vehicle_counter.py', 'multi_camera_api.py', 
         'installer.py', 'custom_tracker.yaml', 'app_icon.ico',
-        'requirements.txt', 'build_installer.bat', 'LAUNCHER.bat'
+        'requirements.txt'
     ]
     
     with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:

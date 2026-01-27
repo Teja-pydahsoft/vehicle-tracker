@@ -25,7 +25,7 @@ import zipfile
 import shutil
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.24" 
+CURRENT_VERSION = "v1.0.25" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up basic logging

@@ -29,12 +29,14 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.17" 
+CURRENT_VERSION = "v1.0.20" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+logger.info(f"=== SYSTEM STARTUP: {CURRENT_VERSION} ===")
+logger.info(f"RUNNING FROM: {os.path.abspath(__file__)}")
 
 # Premium Light Theme Palette
 COLORS = {
@@ -1581,22 +1583,24 @@ class UltraModernApp(QMainWindow):
                     f.write(f"echo ------------------------------------------\n")
                     f.write(f"echo  AI SMART GATE - INSTALLING UPDATE v{version}\n")
                     f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo Closing all instances of AI Smart Gate...\n")
+                    f.write(f"echo Terminatiing old processes...\n")
                     f.write(f"taskkill /F /IM python.exe /T > nul 2>&1\n")
-                    f.write(f"timeout /t 3 /nobreak > nul\n")
+                    f.write(f"timeout /t 5 /nobreak > nul\n")
                     f.write(f"echo Replacing files in: {install_dir}\n")
-                    # Robocopy /MOVE or /MIR but be careful. /E /IS /IT is safe.
-                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:5 /W:5\n")
+                    # Robust retry logic for Robocopy
+                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:3 /W:3\n")
                     f.write(f"echo.\n")
-                    f.write(f"echo Starting new version...\n")
+                    f.write(f"echo Application has been updated. Relaunching...\n")
                     
                     if getattr(sys, 'frozen', False):
-                        f.write(f"start \"\" \"{os.path.join(install_dir, os.path.basename(sys.executable))}\"\n")
+                        exe_path = os.path.join(install_dir, os.path.basename(sys.executable))
+                        f.write(f"start \"\" \"{exe_path}\"\n")
                     else:
                         python_exe = sys.executable
-                        f.write(f"start \"\" \"{python_exe}\" \"{os.path.join(install_dir, 'main.py')}\"\n")
+                        entry_point = os.path.join(install_dir, 'main.py')
+                        f.write(f"start \"\" \"{python_exe}\" \"{entry_point}\"\n")
                     
-                    f.write(f"echo SUCCESS! This window will close.\n")
+                    f.write(f"echo Success. Close this window.\n")
                     f.write(f"timeout /t 2 > nul\n")
                     f.write(f"exit\n")
                 

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QFrame, QLabel, QPushButton, QTabWidget, QTableWidget, 
     QTableWidgetItem, QHeaderView, QLineEdit, QComboBox, 
     QCheckBox, QGridLayout, QScrollArea, QSizePolicy, QGraphicsDropShadowEffect,
-    QCalendarWidget, QDialog, QStackedWidget, QSplashScreen, QMessageBox
+    QCalendarWidget, QDialog, QStackedWidget, QSplashScreen, QMessageBox, QProgressBar
 )
 from PySide6.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QRect, QPoint, QDate, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalette, QPainter, QTextCharFormat, QMovie, QImage
@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.11" 
+CURRENT_VERSION = "v1.0.12" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging

@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.15" 
+CURRENT_VERSION = "v1.0.16" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -530,7 +530,7 @@ class UpdateOverlay(QDialog):
             }}
             QProgressBar::chunk {{
                 background-color: {COLORS['primary']};
-                border_radius: 5px;
+                border-radius: 5px;
             }}
         """)
         self.progress.setRange(0, 0) # Pulse
@@ -614,7 +614,7 @@ class UpdatePromptDialog(QDialog):
                 background-color: transparent;
                 color: {COLORS['text_muted']};
                 border: 1px solid {COLORS['border']};
-                border_radius: 8px;
+                border-radius: 8px;
                 padding: 12px 20px;
                 font-weight: 700;
                 font-size: 12px;
@@ -1581,8 +1581,8 @@ class UltraModernApp(QMainWindow):
                     f.write(f"echo ------------------------------------------\n")
                     f.write(f"echo  AI SMART GATE - INSTALLING UPDATE v{version}\n")
                     f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo Waiting for processes to unlock...\n")
-                    f.write(f"timeout /t 3 /nobreak > nul\n")
+                    f.write(f"echo Waiting for processes to unlock (5s)...\n")
+                    f.write(f"timeout /t 5 /nobreak > nul\n")
                     f.write(f"echo Replacing files in: {install_dir}\n")
                     # Robocopy /MOVE or /MIR but be careful. /E /IS /IT is safe.
                     f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:5 /W:5\n")

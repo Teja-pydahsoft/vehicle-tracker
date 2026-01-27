@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.14" 
+CURRENT_VERSION = "v1.0.15" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -524,7 +524,7 @@ class UpdateOverlay(QDialog):
             QProgressBar {{
                 background-color: {COLORS['bg_hover']};
                 border: none;
-                border_radius: 5px;
+                border-radius: 5px;
                 height: 10px;
                 text-align: center;
             }}
@@ -1590,7 +1590,7 @@ class UltraModernApp(QMainWindow):
                     f.write(f"echo Starting new version...\n")
                     
                     if getattr(sys, 'frozen', False):
-                        f.write(f"start \"\" \"{sys.executable}\"\n")
+                        f.write(f"start \"\" \"{os.path.join(install_dir, os.path.basename(sys.executable))}\"\n")
                     else:
                         python_exe = sys.executable
                         f.write(f"start \"\" \"{python_exe}\" \"{os.path.join(install_dir, 'main.py')}\"\n")

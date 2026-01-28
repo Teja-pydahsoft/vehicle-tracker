@@ -6,14 +6,308 @@ import multiprocessing
 import time
 import requests
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                               QLabel, QPushButton, QFileDialog, QProgressBar, QMessageBox, QTextEdit, QLineEdit)
+                               QLabel, QPushButton, QFileDialog, QProgressBar, QMessageBox, QTextEdit, QLineEdit, QDialog)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QIcon, QFont, QColor
+from PySide6.QtGui import QIcon, QFont, QColor, QPixmap
 
 def get_resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+class PermissionRequestDialog(QDialog):
+    """Dialog to request PowerShell execution policy permissions"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Permission Required")
+        self.setFixedSize(500, 380)
+        self.setWindowFlags(Qt.Dialog | Qt.MSWindowsFixedSizeDialogHint)
+        self.result_granted = False
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+        
+        # Icon/Header
+        header_layout = QHBoxLayout()
+        icon_label = QLabel("🔒")
+        icon_label.setStyleSheet("font-size: 48px;")
+        icon_label.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(icon_label)
+        
+        title_layout = QVBoxLayout()
+        title = QLabel("PowerShell Execution Policy")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #1e293b;")
+        subtitle = QLabel("Required for Desktop Shortcut Creation")
+        subtitle.setStyleSheet("font-size: 14px; color: #64748b;")
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
+        header_layout.addLayout(title_layout)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+        
+        # Explanation
+        explanation = QLabel(
+            "To create a desktop shortcut, this installer needs to run a PowerShell command.\n\n"
+            "Some Windows systems restrict PowerShell execution for security. We need your permission to temporarily allow this.\n\n"
+            "This is safe and only affects this installation process."
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet("""
+            QLabel {
+                background-color: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 15px;
+                color: #475569;
+                font-size: 13px;
+                line-height: 1.5;
+            }
+        """)
+        layout.addWidget(explanation)
+        
+        # Info box
+        info_box = QLabel("💡 This will set: Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned")
+        info_box.setWordWrap(True)
+        info_box.setStyleSheet("""
+            QLabel {
+                background-color: #eff6ff;
+                border: 1px solid #bfdbfe;
+                border-radius: 6px;
+                padding: 10px;
+                color: #1e40af;
+                font-size: 11px;
+            }
+        """)
+        layout.addWidget(info_box)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        deny_btn = QPushButton("Skip Shortcut")
+        deny_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f1f5f9;
+                color: #475569;
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+                padding: 10px 20px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #e2e8f0;
+            }
+        """)
+        deny_btn.clicked.connect(self.deny_permission)
+        button_layout.addWidget(deny_btn)
+        
+        grant_btn = QPushButton("Grant Permission")
+        grant_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6366f1;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 24px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #4f46e5;
+            }
+        """)
+        grant_btn.clicked.connect(self.grant_permission)
+        button_layout.addWidget(grant_btn)
+        
+        layout.addLayout(button_layout)
+        
+    def grant_permission(self):
+        """Attempt to grant PowerShell execution policy permission"""
+        try:
+            # Try to set execution policy for current user (doesn't require admin)
+            cmd = 'powershell -Command "Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force"'
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            if result.returncode == 0:
+                self.result_granted = True
+                QMessageBox.information(self, "Permission Granted", 
+                    "PowerShell execution policy has been updated.\n\nYou can now create desktop shortcuts.")
+                self.accept()
+            else:
+                # Try alternative method (Bypass for this session only)
+                QMessageBox.warning(self, "Permission Update", 
+                    "Could not permanently change execution policy.\n\n"
+                    "The installer will try to use alternative methods to create the shortcut.")
+                self.accept()
+                
+        except Exception as e:
+            QMessageBox.warning(self, "Permission Update", 
+                f"Could not update execution policy: {str(e)}\n\n"
+                "The installer will try alternative methods to create the shortcut.")
+            self.accept()
+    
+    def deny_permission(self):
+        """User chose to skip shortcut creation"""
+        self.result_granted = False
+        self.accept()
+    
+    def was_granted(self):
+        return self.result_granted
+
+class PermissionRequestDialog(QDialog):
+    """Dialog to request PowerShell execution policy permissions"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Permission Required")
+        self.setFixedSize(500, 350)
+        self.setWindowFlags(Qt.Dialog | Qt.MSWindowsFixedSizeDialogHint)
+        self.result_granted = False
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+        
+        # Icon/Header
+        header_layout = QHBoxLayout()
+        icon_label = QLabel("🔒")
+        icon_label.setStyleSheet("font-size: 48px;")
+        icon_label.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(icon_label)
+        
+        title_layout = QVBoxLayout()
+        title = QLabel("PowerShell Execution Policy")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #1e293b;")
+        subtitle = QLabel("Required for Desktop Shortcut Creation")
+        subtitle.setStyleSheet("font-size: 14px; color: #64748b;")
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
+        header_layout.addLayout(title_layout)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+        
+        # Explanation
+        explanation = QLabel(
+            "To create a desktop shortcut, this installer needs to run a PowerShell command.\n\n"
+            "Some Windows systems restrict PowerShell execution for security. We need your permission to temporarily allow this.\n\n"
+            "This is safe and only affects this installation process."
+        )
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet("""
+            QLabel {
+                background-color: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 15px;
+                color: #475569;
+                font-size: 13px;
+                line-height: 1.5;
+            }
+        """)
+        layout.addWidget(explanation)
+        
+        # Info box
+        info_box = QLabel("💡 This will set: Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned")
+        info_box.setWordWrap(True)
+        info_box.setStyleSheet("""
+            QLabel {
+                background-color: #eff6ff;
+                border: 1px solid #bfdbfe;
+                border-radius: 6px;
+                padding: 10px;
+                color: #1e40af;
+                font-size: 11px;
+            }
+        """)
+        layout.addWidget(info_box)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        deny_btn = QPushButton("Skip Shortcut")
+        deny_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f1f5f9;
+                color: #475569;
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+                padding: 10px 20px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #e2e8f0;
+            }
+        """)
+        deny_btn.clicked.connect(self.deny_permission)
+        button_layout.addWidget(deny_btn)
+        
+        grant_btn = QPushButton("Grant Permission")
+        grant_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6366f1;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 24px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #4f46e5;
+            }
+        """)
+        grant_btn.clicked.connect(self.grant_permission)
+        button_layout.addWidget(grant_btn)
+        
+        layout.addLayout(button_layout)
+        
+    def grant_permission(self):
+        """Attempt to grant PowerShell execution policy permission"""
+        try:
+            # Try to set execution policy for current user (doesn't require admin)
+            cmd = 'powershell -Command "Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force"'
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            if result.returncode == 0:
+                self.result_granted = True
+                QMessageBox.information(self, "Permission Granted", 
+                    "PowerShell execution policy has been updated.\n\nYou can now create desktop shortcuts.")
+                self.accept()
+            else:
+                # Try alternative method (Bypass for this session only)
+                QMessageBox.warning(self, "Permission Update", 
+                    "Could not permanently change execution policy.\n\n"
+                    "The installer will try to use alternative methods to create the shortcut.")
+                self.accept()
+                
+        except Exception as e:
+            QMessageBox.warning(self, "Permission Update", 
+                f"Could not update execution policy: {str(e)}\n\n"
+                "The installer will try alternative methods to create the shortcut.")
+            self.accept()
+    
+    def deny_permission(self):
+        """User chose to skip shortcut creation"""
+        self.result_granted = False
+        self.accept()
+    
+    def was_granted(self):
+        return self.result_granted
 
 def find_system_python():
     # 1. Try 'python'
@@ -185,16 +479,148 @@ class InstallWorker(QThread):
 
             # Step 5: Access
             self.progress.emit("Step 5/5: Configuring System Access...")
-            shortcut_path = os.path.join(os.environ["USERPROFILE"], "Desktop", "AI Smart Vehicle Monitoring System.lnk")
+            
+            # Create launcher batch file
             launcher_path = os.path.join(self.target_dir, "LAUNCHER.bat")
             with open(launcher_path, "w") as f:
                 # Use python.exe (not pythonw.exe) to ensure terminal stays visible for logs
                 f.write(f"@echo off\ncd /d \"%~dp0\"\nstart \"\" \"env\\Scripts\\python.exe\" main.py\nexit\n")
-
-            icon_p = os.path.join(self.target_dir, 'app_icon.ico')
-            ps_cmd = f"$s=(New-Object -COM WScript.Shell).CreateShortcut('{shortcut_path}');$s.TargetPath='{launcher_path}';$s.WorkingDirectory='{self.target_dir}';$s.IconLocation='{icon_p}';$s.Save()"
-            subprocess.run(["powershell", "-Command", ps_cmd], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            self.log.emit("LINK > Desktop Shortcut Created", "#10b981")
+            self.log.emit("READY > Launcher Script Created", "#10b981")
+            
+            # Try to create desktop shortcut (non-blocking - don't fail installation if this fails)
+            shortcut_created = False
+            desktop_path = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+            
+            # Check if Desktop exists (some systems might have different paths)
+            if not os.path.exists(desktop_path):
+                # Try Public Desktop as fallback
+                public_desktop = os.path.join(os.environ.get("PUBLIC", ""), "Desktop")
+                if os.path.exists(public_desktop):
+                    desktop_path = public_desktop
+                else:
+                    # Try to find Desktop via shell folder
+                    try:
+                        import winreg
+                        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+                        desktop_path = winreg.QueryValueEx(key, "Desktop")[0]
+                        winreg.CloseKey(key)
+                    except:
+                        pass
+            
+            if os.path.exists(desktop_path):
+                shortcut_path = os.path.join(desktop_path, "AI Smart Vehicle Monitoring System.lnk")
+                icon_p = os.path.join(self.target_dir, 'app_icon.ico')
+                
+                # Method 1: Try PowerShell (most reliable)
+                try:
+                    # First, check if we need to request permission
+                    # Test PowerShell execution policy
+                    test_cmd = 'powershell -Command "Get-ExecutionPolicy -Scope CurrentUser"'
+                    test_result = subprocess.run(
+                        test_cmd,
+                        shell=True,
+                        capture_output=True,
+                        timeout=5,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    
+                    execution_policy_ok = False
+                    if test_result.returncode == 0:
+                        policy = test_result.stdout.decode().strip().lower()
+                        # RemoteSigned, Unrestricted, or Bypass are OK
+                        if any(p in policy for p in ['remotesigned', 'unrestricted', 'bypass']):
+                            execution_policy_ok = True
+                    
+                    # If policy is restricted, show permission dialog (but only once)
+                    if not execution_policy_ok and not hasattr(self, '_permission_asked'):
+                        self._permission_asked = True
+                        # We can't show dialog from worker thread, so log and try anyway
+                        self.log.emit("INFO > Attempting PowerShell with Bypass flag...", "#94a3b8")
+                    
+                    # Escape paths properly for PowerShell
+                    shortcut_escaped = shortcut_path.replace("'", "''").replace("$", "`$")
+                    launcher_escaped = launcher_path.replace("'", "''").replace("$", "`$")
+                    target_dir_escaped = self.target_dir.replace("'", "''").replace("$", "`$")
+                    icon_escaped = icon_p.replace("'", "''").replace("$", "`$")
+                    
+                    ps_cmd = f"$s=(New-Object -COM WScript.Shell).CreateShortcut('{shortcut_escaped}');$s.TargetPath='{launcher_escaped}';$s.WorkingDirectory='{target_dir_escaped}';if(Test-Path '{icon_escaped}'){{$s.IconLocation='{icon_escaped}'}};$s.Save()"
+                    
+                    result = subprocess.run(
+                        ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                        capture_output=True,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    
+                    if result.returncode == 0:
+                        shortcut_created = True
+                        self.log.emit("LINK > Desktop Shortcut Created (PowerShell)", "#10b981")
+                    else:
+                        error_msg = result.stderr.decode() if result.stderr else "Unknown error"
+                        if "execution policy" in error_msg.lower() or "script execution" in error_msg.lower():
+                            raise Exception("Execution policy restricted")
+                        else:
+                            raise Exception(f"PowerShell returned {result.returncode}: {error_msg[:100]}")
+                        
+                except Exception as e:
+                    # Method 2: Try VBScript (fallback)
+                    try:
+                        vbscript = f"""
+Set oWS = WScript.CreateObject("WScript.Shell")
+sLinkFile = "{shortcut_path}"
+Set oLink = oWS.CreateShortcut(sLinkFile)
+oLink.TargetPath = "{launcher_path}"
+oLink.WorkingDirectory = "{self.target_dir}"
+oLink.IconLocation = "{icon_p}"
+oLink.Save
+"""
+                        vbscript_path = os.path.join(self.target_dir, "create_shortcut.vbs")
+                        with open(vbscript_path, "w") as vbs:
+                            vbs.write(vbscript)
+                        
+                        result = subprocess.run(
+                            ["cscript", "//nologo", vbscript_path],
+                            cwd=self.target_dir,
+                            capture_output=True,
+                            timeout=10,
+                            creationflags=subprocess.CREATE_NO_WINDOW
+                        )
+                        
+                        if result.returncode == 0:
+                            shortcut_created = True
+                            self.log.emit("LINK > Desktop Shortcut Created (VBScript)", "#10b981")
+                        else:
+                            raise Exception(f"VBScript returned {result.returncode}")
+                        
+                        # Clean up temp VBScript
+                        try:
+                            os.remove(vbscript_path)
+                        except:
+                            pass
+                            
+                    except Exception as e2:
+                        # Method 3: Try direct COM object via Python (if available)
+                        try:
+                            import win32com.client
+                            shell = win32com.client.Dispatch("WScript.Shell")
+                            shortcut = shell.CreateShortCut(shortcut_path)
+                            shortcut.Targetpath = launcher_path
+                            shortcut.WorkingDirectory = self.target_dir
+                            if os.path.exists(icon_p):
+                                shortcut.IconLocation = icon_p
+                            shortcut.save()
+                            shortcut_created = True
+                            self.log.emit("LINK > Desktop Shortcut Created (COM)", "#10b981")
+                        except:
+                            pass
+                
+                if not shortcut_created:
+                    # Installation succeeded, but shortcut creation failed - log warning but don't fail
+                    self.log.emit("WARNING > Could not create desktop shortcut (installation still successful)", "#f59e0b")
+                    self.log.emit(f"INFO > You can launch from: {launcher_path}", "#94a3b8")
+            else:
+                self.log.emit("WARNING > Desktop folder not found, skipping shortcut creation", "#f59e0b")
+                self.log.emit(f"INFO > You can launch from: {launcher_path}", "#94a3b8")
             
             self.percent.emit(100)
             self.finished.emit(True, "Success")
@@ -350,6 +776,41 @@ class SetupWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not create directory: {e}")
             return
+
+        # Check PowerShell execution policy and request permission if needed
+        try:
+            test_cmd = 'powershell -Command "Get-ExecutionPolicy -Scope CurrentUser"'
+            test_result = subprocess.run(
+                test_cmd,
+                shell=True,
+                capture_output=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            execution_policy_ok = False
+            if test_result.returncode == 0:
+                policy = test_result.stdout.decode().strip().lower()
+                # RemoteSigned, Unrestricted, or Bypass are OK
+                if any(p in policy for p in ['remotesigned', 'unrestricted', 'bypass']):
+                    execution_policy_ok = True
+            
+            # If policy is restricted, show permission dialog
+            if not execution_policy_ok:
+                perm_dialog = PermissionRequestDialog(self)
+                if perm_dialog.exec() == QDialog.Accepted:
+                    if perm_dialog.was_granted():
+                        # Permission was granted, continue with installation
+                        pass
+                    else:
+                        # User chose to skip shortcut, continue anyway
+                        pass
+                else:
+                    # User closed dialog, continue anyway
+                    pass
+        except Exception as e:
+            # If we can't check policy, just continue - we'll handle it during shortcut creation
+            pass
 
         self.install_btn.setEnabled(False)
         self.browse_btn.setEnabled(False)

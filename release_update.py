@@ -75,39 +75,90 @@ def main():
     update_version(target_file, new_ver)
     update_version('main.py', new_ver)
     
-    # 2. Skip Heavy EXE Build
-    print("\n2. Skipping PyInstaller build (Source-only update mode)...")
-    print("Benefit: Your update will be ~2MB instead of 2GB!")
+    # 2. Check for EXE Build
+    print("\n2. Checking for EXE build...")
+    exe_path = None
+    exe_name = "AI_Smart_Vehicle_Monitoring_System.exe"
+    
+    # Check common EXE locations
+    possible_exe_paths = [
+        os.path.join('dist', exe_name),
+        os.path.join('dist', 'AI_Smart_Vehicle_Monitoring_System', exe_name),
+        exe_name
+    ]
+    
+    for path in possible_exe_paths:
+        if os.path.exists(path):
+            exe_path = path
+            print(f"Found EXE: {exe_path}")
+            break
+    
+    if not exe_path:
+        print("No EXE found. Creating source-only update (clients must have Python installed).")
+        print("To include EXE: Run 'build_single_exe.bat' first, then run this script again.")
+    else:
+        print(f"EXE will be included in update package.")
 
     # 3. Create Zip Package
     # 3. Create Release ZIP (Source Based for fast Remote Updates)
     print("\n3. Creating Source-based Release ZIP...")
     zip_name = 'VehicleCounter.zip'
+    
+    # Core Python files (required for updates)
     source_files = [
-        'main.py', 'vehicle_counter.py', 'multi_camera_api.py', 
-        'installer.py', 'custom_tracker.yaml', 'app_icon.ico',
+        'main.py', 
+        'vehicle_counter.py', 
+        'multi_camera_api.py',
+        'api_server.py',  # Added - might be needed
+        'installer.py', 
+        'custom_tracker.yaml', 
+        'data.yaml',  # Added - YOLO config file
+        'app_icon.ico',
         'requirements.txt'
     ]
     
+    # Create zip file
     with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Add core source files
         for f in source_files:
             if os.path.exists(f):
                 print(f"Adding to ZIP: {f}")
-                zipf.write(f)
+                zipf.write(f, f)  # Store with same name (root level)
             else:
                 print(f"Warning: File not found, skipping: {f}")
+        
+        # Add dashboard folder if it exists (web interface)
+        dashboard_folder = 'dashboard'
+        if os.path.exists(dashboard_folder):
+            print(f"Adding folder to ZIP: {dashboard_folder}/")
+            for root, dirs, files in os.walk(dashboard_folder):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    # Preserve folder structure: dashboard/file.html
+                    arcname = file_path
+                    zipf.write(file_path, arcname)
+        
+        # Add EXE if it exists (for EXE-based installations)
+        if exe_path and os.path.exists(exe_path):
+            print(f"Adding EXE to ZIP: {exe_path}")
+            zipf.write(exe_path, os.path.basename(exe_path))
+            print("Note: EXE included - this will work for both EXE and source installations")
+        
+        # Note: We're NOT including model files (yolov8n.pt, yolo11n.pt) 
+        # because they're large and can be downloaded on first run
+        # If you need to include them, uncomment below:
+        # model_files = ['yolov8n.pt', 'yolo11n.pt']
+        # for mf in model_files:
+        #     if os.path.exists(mf):
+        #         print(f"Adding model file: {mf} (this will increase ZIP size significantly)")
+        #         zipf.write(mf, mf)
     
-    # Check if we should still include the EXE (Optional)
-    dist_folder = os.path.join('dist', 'VehicleCounter')
-    if os.path.exists(dist_folder):
-        print("\nAdding build binaries to ZIP (this will increase size)...")
-        for root, dirs, files in os.walk(dist_folder):
-             for file in files:
-                 file_path = os.path.join(root, file)
-                 arcname = os.path.relpath(file_path, os.path.dirname(dist_folder))
-                 # Avoid double-adding source if already there
-                 with zipfile.ZipFile(zip_name, 'a', zipfile.ZIP_DEFLATED) as zipf:
-                     zipf.write(file_path, arcname)
+    zip_size_mb = os.path.getsize(zip_name) / 1024 / 1024
+    print(f"\nZIP created: {zip_name} ({zip_size_mb:.2f} MB)")
+    
+    if zip_size_mb > 100:
+        print("WARNING: ZIP is large (>100MB). Consider excluding EXE for faster updates.")
+        print("         Source-only updates are typically < 10MB.")
     
     # CHECK SPLIT LOGIC
     release_files = [zip_name]

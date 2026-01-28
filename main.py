@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.29" 
+CURRENT_VERSION = "v1.0.30" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -1656,9 +1656,24 @@ class UltraModernApp(QMainWindow):
                         exe_path = os.path.join(install_dir_escaped, os.path.basename(sys.executable))
                         f.write(f'start "" "{exe_path}"\n')
                     else:
-                        python_exe = sys.executable.replace('"', '""')
-                        entry_point = os.path.join(install_dir_escaped, "main.py")
-                        f.write(f'start "" "{python_exe}" "{entry_point}"\n')
+                        # Check if we're running from venv (installer setup)
+                        venv_python = os.path.join(install_dir_escaped, "env", "Scripts", "python.exe")
+                        launcher_bat = os.path.join(install_dir_escaped, "LAUNCHER.bat")
+                        
+                        # Prefer launcher.bat if it exists (installer setup)
+                        if os.path.exists(launcher_bat):
+                            f.write(f'start "" "{launcher_bat}"\n')
+                        # Otherwise use venv python if available
+                        elif os.path.exists(venv_python):
+                            entry_point = os.path.join(install_dir_escaped, "main.py")
+                            venv_python_escaped = venv_python.replace('"', '""')
+                            f.write(f'cd /d "{install_dir_escaped}"\n')
+                            f.write(f'start "" "{venv_python_escaped}" "{entry_point}"\n')
+                        # Fallback to system Python
+                        else:
+                            python_exe = sys.executable.replace('"', '""')
+                            entry_point = os.path.join(install_dir_escaped, "main.py")
+                            f.write(f'start "" "{python_exe}" "{entry_point}"\n')
                     f.write("timeout /t 2 /nobreak > nul\n")
                     # Clean up updater files
                     f.write(f'del /q "{updater_bat}" > nul 2>&1\n')

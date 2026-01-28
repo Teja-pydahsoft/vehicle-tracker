@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QLinearGradient, QPalet
 # We will lazy-load heavy modules (vehicle_counter, multi_camera_api) inside the main check to speed up startup.
 
 # Application Versioning
-CURRENT_VERSION = "v1.0.28" 
+CURRENT_VERSION = "v1.0.29" 
 GITHUB_REPO = "Teja-pydahsoft/vehicle-tracker"
 
 # Set up logging
@@ -1541,7 +1541,15 @@ class UltraModernApp(QMainWindow):
 
         def run_task():
             try:
-                temp_dir = tempfile.mkdtemp()
+                # Get current process ID before any operations
+                current_pid = os.getpid()
+                install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+                
+                # Use a persistent location for updater (not temp dir that might get cleaned)
+                updater_dir = os.path.join(install_dir, ".updater")
+                os.makedirs(updater_dir, exist_ok=True)
+                
+                temp_dir = updater_dir  # Use persistent directory instead of temp
                 zip_path = os.path.join(temp_dir, "update.zip")
                 
                 # Download
@@ -1569,68 +1577,133 @@ class UltraModernApp(QMainWindow):
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(extract_path)
                 
-                overlay.set_status("Applying changes... App will restart.")
+                overlay.set_status("Preparing update... App will restart.")
                 QApplication.processEvents()
+                time.sleep(0.5)
+                
+                # Create updater batch script in persistent location
+                updater_bat = os.path.join(updater_dir, "updater.bat")
+                
+                # Escape paths for batch script (handle spaces and special chars)
+                install_dir_escaped = install_dir.replace('"', '""')
+                extract_path_escaped = extract_path.replace('"', '""')
+                
+                with open(updater_bat, "w", encoding='utf-8') as f:
+                    f.write("@echo off\n")
+                    f.write(f"title AI SMART GATE - MASTER UPDATER v{version}\n")
+                    f.write("echo ------------------------------------------\n")
+                    f.write("echo  SYSTEM UPGRADE IN PROGRESS\n")
+                    f.write("echo ------------------------------------------\n")
+                    f.write("echo.\n")
+                    f.write(f"echo Current PID: {current_pid}\n")
+                    f.write("echo.\n")
+                    f.write("echo [1/4] Waiting for main process to close...\n")
+                    # Wait for the specific process to terminate (more targeted)
+                    f.write(f":wait_loop\n")
+                    f.write(f"tasklist /FI \"PID eq {current_pid}\" 2>nul | find /I \"{current_pid}\" >nul\n")
+                    f.write(f"if %ERRORLEVEL% == 0 (\n")
+                    f.write(f"    timeout /t 1 /nobreak > nul\n")
+                    f.write(f"    goto wait_loop\n")
+                    f.write(f")\n")
+                    f.write("echo Main process terminated.\n")
+                    f.write("timeout /t 2 /nobreak > nul\n")
+                    f.write("echo.\n")
+                    f.write("echo [2/4] Terminating remaining application processes...\n")
+                    # Wait a bit more to ensure main process has closed
+                    f.write("timeout /t 3 /nobreak > nul\n")
+                    # More targeted: kill only processes related to our app
+                    if getattr(sys, 'frozen', False):
+                        exe_name = os.path.basename(sys.executable)
+                        f.write(f'taskkill /F /IM "{exe_name}" > nul 2>&1\n')
+                    else:
+                        # Try to kill python processes that might be holding file locks
+                        # But be more careful - only if they exist
+                        f.write('tasklist /FI "IMAGENAME eq python.exe" 2>nul | find /I "python.exe" >nul\n')
+                        f.write('if %ERRORLEVEL% == 0 (\n')
+                        f.write('    echo Terminating Python processes...\n')
+                        f.write('    taskkill /F /IM python.exe > nul 2>&1\n')
+                        f.write('    taskkill /F /IM pythonw.exe > nul 2>&1\n')
+                        f.write(')\n')
+                    f.write("timeout /t 2 /nobreak > nul\n")
+                    f.write("echo.\n")
+                    f.write("echo [3/4] Preparing system for new assets...\n")
+                    # Rename old files (more reliable than delete)
+                    f.write(f'move /y "{os.path.join(install_dir_escaped, "main.py")}" "{os.path.join(install_dir_escaped, "main.py.old")}" > nul 2>&1\n')
+                    f.write(f'move /y "{os.path.join(install_dir_escaped, "vehicle_counter.py")}" "{os.path.join(install_dir_escaped, "vehicle_counter.py.old")}" > nul 2>&1\n')
+                    f.write(f'move /y "{os.path.join(install_dir_escaped, "multi_camera_api.py")}" "{os.path.join(install_dir_escaped, "multi_camera_api.py.old")}" > nul 2>&1\n')
+                    f.write("timeout /t 1 /nobreak > nul\n")
+                    f.write("echo.\n")
+                    f.write(f"echo [4/4] Installing v{version}...\n")
+                    # Use robocopy with better error handling
+                    f.write(f'robocopy "{extract_path_escaped}" "{install_dir_escaped}" /E /IS /IT /NP /R:3 /W:1 /XD .updater > nul\n')
+                    f.write("if %ERRORLEVEL% GEQ 8 (\n")
+                    f.write("    echo [FATAL] File replacement failed with Error %ERRORLEVEL%.\n")
+                    f.write("    echo Attempting to restore old version...\n")
+                    f.write(f'    move /y "{os.path.join(install_dir_escaped, "main.py.old")}" "{os.path.join(install_dir_escaped, "main.py")}" > nul 2>&1\n')
+                    f.write("    echo.\n")
+                    f.write("    echo Update failed. Old version restored.\n")
+                    f.write("    pause\n")
+                    f.write("    exit /b 1\n")
+                    f.write(")\n")
+                    f.write("echo.\n")
+                    f.write("echo UPGRADE SUCCESSFUL! Relaunching system...\n")
+                    f.write("timeout /t 1 /nobreak > nul\n")
+                    # Clean up old files
+                    f.write(f'del /q "{os.path.join(install_dir_escaped, "*.old")}" > nul 2>&1\n')
+                    f.write("timeout /t 1 /nobreak > nul\n")
+                    # Restart application
+                    if getattr(sys, 'frozen', False):
+                        exe_path = os.path.join(install_dir_escaped, os.path.basename(sys.executable))
+                        f.write(f'start "" "{exe_path}"\n')
+                    else:
+                        python_exe = sys.executable.replace('"', '""')
+                        entry_point = os.path.join(install_dir_escaped, "main.py")
+                        f.write(f'start "" "{python_exe}" "{entry_point}"\n')
+                    f.write("timeout /t 2 /nobreak > nul\n")
+                    # Clean up updater files
+                    f.write(f'del /q "{updater_bat}" > nul 2>&1\n')
+                    f.write(f'rmdir /q "{updater_dir}" > nul 2>&1\n')
+                    f.write("exit /b 0\n")
+                
+                overlay.set_status("Launching updater... Closing application.")
+                QApplication.processEvents()
+                time.sleep(0.5)
+                
+                # Disable closeEvent cleanup to prevent killing updater
+                self._updating = True
+                
+                # Launch updater script and give it time to start
+                # Use CREATE_NEW_CONSOLE to ensure it runs independently
+                CREATE_NEW_CONSOLE = 0x00000010
+                subprocess.Popen(
+                    ['cmd.exe', '/c', updater_bat],
+                    creationflags=CREATE_NEW_CONSOLE,
+                    cwd=updater_dir
+                )
+                
+                # Give updater time to start before closing
                 time.sleep(1)
                 
-                # Final Batch Script (Robust Fix)
-                install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-                updater_bat = os.path.join(temp_dir, "updater.bat")
+                # Close overlay
+                overlay.close()
                 
-                with open(updater_bat, "w") as f:
-                    f.write(f"@echo off\n")
-                    f.write(f"title AI SMART GATE - MASTER UPDATER v{version}\n")
-                    f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo  SYSTEM UPGRADE IN PROGRESS\n")
-                    f.write(f"echo ------------------------------------------\n")
-                    f.write(f"echo.\n")
-                    f.write(f"echo [1/3] Clearing process locks...\n")
-                    f.write(f"taskkill /F /FI \"IMAGENAME eq python*\" /T > nul 2>&1\n")
-                    f.write(f"taskkill /F /FI \"IMAGENAME eq python*\" /T > nul 2>&1\n")
-                    f.write(f"timeout /t 5 /nobreak > nul\n")
-                    
-                    f.write(f"echo [2/3] Preparing system for new assets...\n")
-                    # Renaming is more reliable than deleting on Windows
-                    f.write(f"move /y \"{os.path.join(install_dir, 'main.py')}\" \"{os.path.join(install_dir, 'main.py.old')}\" > nul 2>&1\n")
-                    f.write(f"move /y \"{os.path.join(install_dir, 'vehicle_counter.py')}\" \"{os.path.join(install_dir, 'vehicle_counter.py.old')}\" > nul 2>&1\n")
-                    
-                    f.write(f"echo [3/3] Installing v{version}...\n")
-                    f.write(f"robocopy \"{extract_path}\" \"{install_dir}\" /E /IS /IT /NP /R:10 /W:2\n")
-                    
-                    f.write(f"if %ERRORLEVEL% GEQ 8 (\n")
-                    f.write(f"    echo [FATAL] File replacement failed with Error %ERRORLEVEL%.\n")
-                    f.write(f"    echo Attempting to restore old version...\n")
-                    f.write(f"    move /y \"{os.path.join(install_dir, 'main.py.old')}\" \"{os.path.join(install_dir, 'main.py')}\" > nul 2>&1\n")
-                    f.write(f"    pause\n")
-                    f.write(f"    exit\n")
-                    f.write(f")\n")
-                    
-                    f.write(f"echo.\n")
-                    f.write(f"echo UPGRADE SUCCESSFUL! Relaunching system...\n")
-                    f.write(f"del /q \"{os.path.join(install_dir, '*.old')}\" > nul 2>&1\n")
-                    
-                    if getattr(sys, 'frozen', False):
-                        exe_path = os.path.join(install_dir, os.path.basename(sys.executable))
-                        f.write(f"start \"\" \"{exe_path}\"\n")
-                    else:
-                        python_exe = sys.executable
-                        entry_point = os.path.join(install_dir, 'main.py')
-                        f.write(f"start \"\" \"{python_exe}\" \"{entry_point}\"\n")
-                    
-                    f.write(f"exit\n")
-                
-                # Use subprocess to launch cmd with proper priority
-                subprocess.Popen(['cmd.exe', '/c', 'start', '/high', 'cmd.exe', '/c', updater_bat], shell=True)
-                self.close()
-                sys.exit(0)
+                # Close application gracefully (don't use sys.exit immediately)
+                QApplication.quit()
                 
             except Exception as e:
                 overlay.close()
-                QMessageBox.critical(self, "Update Failed", f"Update error: {e}")
+                logger.error(f"Update error: {e}", exc_info=True)
+                QMessageBox.critical(self, "Update Failed", f"Update error: {e}\n\nPlease try updating manually.")
 
         QTimer.singleShot(500, run_task)
 
     def closeEvent(self, event):
+        # Skip cleanup if we're updating (let updater handle it)
+        if hasattr(self, '_updating') and self._updating:
+            logger.info("Update in progress, skipping cleanup...")
+            event.accept()
+            return
+        
         logger.info("Application closing. Terminating all background processes...")
         
         # Stop UI viewer threads
@@ -1645,14 +1718,17 @@ class UltraModernApp(QMainWindow):
             parent = psutil.Process(os.getpid())
             for child in parent.children(recursive=True):
                 try:
-                    child.terminate()
+                    # Don't kill updater processes
+                    if 'updater' not in child.name().lower():
+                        child.terminate()
                 except: pass
             
             # Wait for shutdown
             gone, alive = psutil.wait_procs(parent.children(), timeout=2)
             for p in alive:
                 try:
-                    p.kill()
+                    if 'updater' not in p.name().lower():
+                        p.kill()
                 except: pass
         except Exception as e:
             logger.error(f"Error during process cleanup: {e}")
